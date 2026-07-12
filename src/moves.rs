@@ -25,8 +25,8 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
         if nextrow == promo_rank as usize { 
             for promo in [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight] {
                 moves.push(Move {from: (row, column), to: (nextrow,column)});
-            } 
-        }      
+            }
+        }
         else {
                 //Normal Single Push
                 moves.push(Move {from: (row, column), to: (nextrow, column) });
@@ -39,4 +39,17 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
     }
 
     moves
+}
+
+//Knight
+pub fn generate_knight_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
+    const STEPS: [(isize,isize);8] = [
+        (2, 1), (2, -1), (-2, 1), (-2, -1),
+        (1, 2), (1, -2), (-1, 2), (-1, -2),
+    ];
+
+    let mut moves = vec![];
+
+    for (dr, dc) in STEPS {}
+
 }
