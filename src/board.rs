@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::moves::Move;
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Color { White, Black }
 
@@ -40,6 +42,17 @@ impl Board {
         }
 
         Board { grid }
+    }
+
+    pub fn make_move(&mut self, mv: &Move) -> bool {
+        // This line MODIFIES the board (via &mut self):
+        self.grid[mv.to.0][mv.to.1] = self.grid[mv.from];
+        self.grid[mv.from] = None;
+        // The bool is just a status:
+        if something_went_wrong {
+          return false;  // move failed
+        }
+        true  // move succeeded
     }
 }
 

@@ -3,7 +3,7 @@
 ## To-Do
 
   1. Write a README.md
-  2. Create an Input System
+  2. Create an Input System.
   3. ~~Add move generation for other PieceTypes~~
         - ~~Knight~~ 
         - ~~Rook~~
