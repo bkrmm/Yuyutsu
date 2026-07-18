@@ -1,11 +1,36 @@
 #![allow(dead_code)]
 #![allow(unused)]
 
-use crate::board::{Board, Color, PieceType};
+use crate::board::{Board, Color, PieceType, Piece};
 
 pub struct Move {
     pub from: (usize, usize),
     pub to: (usize, usize),
+}
+
+pub fn generate_pseudo_moves(board: &Board, row: usize, column: usize, color: Color, piece: Piece) -> Vec<Move> {
+    match piece.kind {
+        PieceType::Pawn => generate_pawn_moves(board, row, column, piece.color),
+        PieceType::Knight => generate_knight_moves(board, row, column, piece.color),
+        PieceType::Bishop => generate_bishop_moves(board, row, column, piece.color),
+        PieceType::Rook => generate_rook_moves(board, row, column, piece.color),
+        PieceType::King => generate_king_moves(board, row, column, piece.color),
+        PieceType::Queen => generate_queen_moves(board, row, column, piece.color)
+    }
+}
+
+pub fn generate_all_moves(board: &Board, color: Color) -> Vec<Move> {
+    let mut moves = vec![];
+    for r in 0..8 {
+        for c in 0..8 {
+            if let Some(piece) = board.grid[r][c] {
+                if piece.color == color {
+                    moves.extend(generate_pseudo_moves(board, r, c, color, piece));
+                }
+            }
+        }
+    }
+    moves
 }
 
 //pawn

@@ -5,7 +5,7 @@
   1. Write a README.md
   2. Create an Input System.
   3. ~~Add move generation for other PieceTypes~~
-        - ~~Knight~~ 
+        - ~~Knight~~
         - ~~Rook~~
         - ~~Bishop~~
         - ~~Queen~~
