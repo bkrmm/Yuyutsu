@@ -5,6 +5,15 @@ use crate::moves::Move;
 #[derive(Clone, Copy, PartialEq)]
 pub enum Color { White, Black }
 
+impl Color {
+    pub fn opponent(self) -> Color {
+        match self {
+            Color::White => Color::Black,
+            Color::Black => Color::White,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum PieceType { Pawn, Knight, Bishop, Rook, Queen, King }
 
@@ -12,6 +21,28 @@ pub enum PieceType { Pawn, Knight, Bishop, Rook, Queen, King }
 pub struct Piece {
     pub color: Color,
     pub kind: PieceType,
+}
+
+pub fn in_check(board: &Board, color: Color) -> bool {
+    let mut king_pos = None;
+    'outer: for r in 0..8 {
+        for c in 0..8 {
+            if let Some(piece) = board.grid[r][c] {
+                if piece.color == color && piece.kind == PieceType::King {
+                    king_pos = Some((r, c));
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let king_pos = match king_pos {
+        Some(pos) => pos,
+        None => return false,
+    };
+
+    let opponent_moves = crate::moves::generate_all_moves(board, color.opponent());
+    opponent_moves.iter().any(|mv| mv.to == king_pos)
 }
 
 pub struct Board {
