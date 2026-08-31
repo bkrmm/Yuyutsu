@@ -6,6 +6,7 @@ use crate::board::{Board, Color, PieceType, Piece};
 pub struct Move {
     pub from: (usize, usize),
     pub to: (usize, usize),
+    pub promotion : Option<PieceType>, //none for non-pawn moves
 }
 
 pub fn generate_pseudo_moves(board: &Board, row: usize, column: usize, color: Color, piece: Piece) -> Vec<Move> {
@@ -49,16 +50,16 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
         //promotion
         if nextrow == promo_rank as usize {
             for promo in [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight] {
-                moves.push(Move {from: (row, column), to: (nextrow, column)});
+                moves.push(Move {from: (row, column), to: (nextrow, column), promotion: Some(promo)});
             }
         }
         else {
                 //Normal Single Push
-                moves.push(Move {from: (row, column), to: (nextrow, column) });
+                moves.push(Move {from: (row, column), to: (nextrow, column), promotion: None });
 
                 //Double Push
                 if row == home_rank as usize {
-                    moves.push(Move {from: (row, column), to: (double_push, column) });
+                    moves.push(Move {from: (row, column), to: (double_push, column), promotion: None});
                 }
         }
     }
@@ -71,7 +72,7 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
 
         if let Some(piece) = &board.grid[nr][nc] {
             if piece.color != color {
-                moves.push(Move { from: (row, column), to: (nr, nc) });
+                moves.push(Move { from: (row, column), to: (nr, nc), promotion: None });
             }
         }
     }
@@ -100,7 +101,7 @@ pub fn generate_knight_moves(board: &Board, row: usize, column: usize, color: Co
 
         match board.grid[nr][nc] {
             Some(piece) if piece.color == color => {}
-            _ => moves.push(Move { from: (row, column), to: (nr, nc) }),
+            _ => moves.push(Move { from: (row, column), to: (nr, nc), promotion: None }),
         }
     }
 
@@ -123,11 +124,11 @@ pub fn generate_bishop_moves(board: &Board, row: usize, column: usize, color: Co
             let (r, c) = (nr as usize, nc as usize);
             match board.grid[r][c] {
                 None => {
-                    moves.push(Move { from: (row, column), to: (r, c) });
+                    moves.push(Move { from: (row, column), to: (r, c), promotion: None });
                 }
                 Some(piece) => {
                     if piece.color != color {
-                        moves.push(Move { from: (row, column), to: (r, c) });
+                        moves.push(Move { from: (row, column), to: (r, c), promotion: None});
                     }
                     break;
                 }
@@ -156,11 +157,11 @@ pub fn generate_rook_moves(board: &Board, row: usize, column: usize, color: Colo
             let (r, c) = (nr as usize, nc as usize);
             match board.grid[r][c] {
                 None => {
-                    moves.push(Move { from: (row, column), to: (r, c) });
+                    moves.push(Move { from: (row, column), to: (r, c), promotion: None });
                 }
                 Some(piece) => {
                     if piece.color != color {
-                        moves.push(Move { from: (row, column), to: (r, c) });
+                        moves.push(Move { from: (row, column), to: (r, c), promotion: None });
                     }
                     break;
                 }
@@ -201,7 +202,7 @@ pub fn generate_king_moves(board: &Board, row: usize, column: usize, color: Colo
 
         match board.grid[nr][nc] {
             Some(piece) if piece.color == color => {}
-            _ => moves.push(Move { from: (row, column), to: (nr, nc) }),
+            _ => moves.push(Move { from: (row, column), to: (nr, nc), promotion: None }),
         }
     }
 
