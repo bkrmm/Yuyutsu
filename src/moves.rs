@@ -1,15 +1,13 @@
-#![allow(dead_code)]
-#![allow(unused)]
-
 use crate::board::{Board, Color, PieceType, Piece};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Move {
     pub from: (usize, usize),
     pub to: (usize, usize),
     pub promotion : Option<PieceType>, //none for non-pawn moves
 }
 
-pub fn generate_pseudo_moves(board: &Board, row: usize, column: usize, color: Color, piece: Piece) -> Vec<Move> {
+pub fn generate_pseudo_moves(board: &Board, row: usize, column: usize, piece: Piece) -> Vec<Move> {
     match piece.kind {
         PieceType::Pawn => generate_pawn_moves(board, row, column, piece.color),
         PieceType::Knight => generate_knight_moves(board, row, column, piece.color),
@@ -26,7 +24,7 @@ pub fn generate_all_moves(board: &Board, color: Color) -> Vec<Move> {
         for c in 0..8 {
             if let Some(piece) = board.grid[r][c] {
                 if piece.color == color {
-                    moves.extend(generate_pseudo_moves(board, r, c, color, piece));
+                    moves.extend(generate_pseudo_moves(board, r, c, piece));
                 }
             }
         }
@@ -39,17 +37,19 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
     let forward: isize = if color == Color::White {-1} else {1};
     let promo_rank: isize  = if color == Color::White {0} else {7};
     let home_rank: isize = if color == Color::White {6} else {1};
+    let promos = [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight];
     let mut moves: Vec<Move> = vec![];
 
-    //Single Push
-    let nextrow = (row as isize + forward) as usize;
-    let double_push = (row as isize + 2 * forward) as usize;
+    //stay isize until the target rank is known to be on the board
+    let nextrow_i = row as isize + forward;
+    if nextrow_i < 0 || nextrow_i >= 8 { return moves; }
+    let nextrow = nextrow_i as usize;
 
-    //collision detection
+    //Single Push
     if board.grid[nextrow][column].is_none() {
         //promotion
-        if nextrow == promo_rank as usize {
-            for promo in [PieceType::Queen, PieceType::Rook, PieceType::Bishop, PieceType::Knight] {
+        if nextrow as isize == promo_rank {
+            for promo in promos {
                 moves.push(Move {from: (row, column), to: (nextrow, column), promotion: Some(promo)});
             }
         }
@@ -58,21 +58,31 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
                 moves.push(Move {from: (row, column), to: (nextrow, column), promotion: None });
 
                 //Double Push
-                if row == home_rank as usize {
-                    moves.push(Move {from: (row, column), to: (double_push, column), promotion: None});
+                if row as isize == home_rank {
+                    let double_push = (row as isize + 2 * forward) as usize;
+                    //the outer check only clears the intermediate square, not the landing square
+                    if board.grid[double_push][column].is_none() {
+                        moves.push(Move {from: (row, column), to: (double_push, column), promotion: None});
+                    }
                 }
         }
     }
 
     //Captures (diagonal)
-    for dc in [-1, 1] {
+    for dc in [-1isize, 1] {
         let nc = column as isize + dc;
         if nc < 0 || nc >= 8 { continue; }
-        let (nc, nr) = (nc as usize, nextrow);
+        let nc = nc as usize;
 
-        if let Some(piece) = &board.grid[nr][nc] {
-            if piece.color != color {
-                moves.push(Move { from: (row, column), to: (nr, nc), promotion: None });
+        if let Some(piece) = board.grid[nextrow][nc] {
+            if piece.color == color { continue; }
+
+            if nextrow as isize == promo_rank {
+                for promo in promos {
+                    moves.push(Move { from: (row, column), to: (nextrow, nc), promotion: Some(promo) });
+                }
+            } else {
+                moves.push(Move { from: (row, column), to: (nextrow, nc), promotion: None });
             }
         }
     }

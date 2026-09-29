@@ -1,16 +1,17 @@
-#![allow(dead_code)]
-#![allow(unused)]
-
-mod moves;
-mod board;
-
-use crate::board::Color;
+use yuyutsu::{board, moves};
 
 fn main() {
     let mut b = board::Board::new();
-    let moves_list = moves::generate_all_moves(&b, board::Color::White); //implement a legality filter over this fn
-    if !moves_list.is_empty() {
-        b.make_move(&moves_list[8]);
+    let color = b.side_to_move;
+    let moves_list = moves::generate_all_moves(&b, color);
+
+    match moves_list.first() {
+        Some(mv) => match b.make_move(mv) {
+            Ok(_undo) => {}
+            Err(e) => println!("make_move rejected {mv:?}: {e:?}"),
+        },
+        None => println!("no legal moves for {color:?}"),
     }
+
     println!("{b}");
 }
