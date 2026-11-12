@@ -93,22 +93,33 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
         }
     }
 
-    //Captures (diagonal)
+    // Captures (diagonal), plus en passant.
     for dc in [-1isize, 1] {
         let nc = column as isize + dc;
         if nc < 0 || nc >= 8 { continue; }
-        let nc = nc as usize;
+        let target = (nextrow, nc as usize);
 
-        if let Some(piece) = board.grid[nextrow][nc] {
-            if piece.color == color { continue; }
+        match board.grid[target.0][target.1] {
+            Some(piece) if piece.color == color => {}
 
-            if nextrow as isize == promo_rank {
-                for promo in promos {
-                    moves.push(Move { from: (row, column), to: (nextrow, nc), promotion: Some(promo) });
+            Some(_) => {
+                if nextrow as isize == promo_rank {
+                    for promo in promos {
+                        moves.push(Move { from: (row, column), to: target, promotion: Some(promo) });
+                    }
+                } else {
+                    moves.push(Move { from: (row, column), to: target, promotion: None });
                 }
-            } else {
-                moves.push(Move { from: (row, column), to: (nextrow, nc), promotion: None });
             }
+
+            // An empty diagonal square is only reachable by en passant, and only
+            // when the board records that exact target. The captured pawn stands
+            // beside the mover, which is why the target itself is empty.
+            None if board.en_passant == Some(target) => {
+                moves.push(Move { from: (row, column), to: target, promotion: None });
+            }
+
+            None => {}
         }
     }
 
@@ -233,12 +244,18 @@ pub fn generate_queen_moves(board: &Board, row: usize, column: usize, color: Col
     moves
 }
 
-/// Generates pseudo-legal king moves from one square.
+/// Generates pseudo-legal king moves from one square, including castling.
 ///
-/// Technically: a single step in each of eight directions. Two deliberate gaps:
-/// no castling yet, and no check-safety -- a king may be generated onto an
-/// attacked square. Both are resolved elsewhere: castling by a future generator,
-/// check-safety by `Board::generate_legal_moves`, which removes those moves.
+/// Technically: a single step in each of eight directions, plus castling when it
+/// is structurally possible -- rights intact, rook still on its corner, and every
+/// square between king and rook empty. Castling is emitted as an ordinary
+/// `Move` from e1 to g1 (or c1), because a two-file king move is unambiguous.
+///
+/// Two rules are deliberately *not* checked here: the king may not castle out of
+/// check, and may not cross an attacked square. Those belong to
+/// `Board::generate_legal_moves`, because this generator must stay free of
+/// king-safety logic -- if it filtered for safety, the legality filter would
+/// have nothing left to do and could never be tested independently.
 pub fn generate_king_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     const STEPS: [(isize, isize); 8] = [
         (0, 1), (0, -1), (1, 0), (-1, 0),
@@ -261,6 +278,32 @@ pub fn generate_king_moves(board: &Board, row: usize, column: usize, color: Colo
             Some(piece) if piece.color == color => {}
             _ => moves.push(Move { from: (row, column), to: (nr, nc), promotion: None }),
         }
+    }
+
+    // Castling is only possible from the king's home square.
+    let home_row = if color == Color::White { 7 } else { 0 };
+    if row != home_row || column != 4 {
+        return moves;
+    }
+
+    // A right is only meaningful if the rook it refers to is actually there.
+    // Rights are revoked when the rook leaves or is captured, so this is a
+    // defensive check for hand-built positions rather than a normal case.
+    let rook_home = |col: usize| {
+        board.grid[home_row][col]
+            .is_some_and(|piece| piece.color == color && piece.kind == PieceType::Rook)
+    };
+    let empty = |col: usize| board.grid[home_row][col].is_none();
+
+    // King side: f1 and g1 must be clear.
+    if board.castling.kingside(color) && rook_home(7) && empty(5) && empty(6) {
+        moves.push(Move { from: (row, column), to: (home_row, 6), promotion: None });
+    }
+
+    // Queen side: b1, c1 and d1 must be clear. b1 is easy to forget -- it is
+    // empty in the diagram but the rook passes through it.
+    if board.castling.queenside(color) && rook_home(0) && empty(1) && empty(2) && empty(3) {
+        moves.push(Move { from: (row, column), to: (home_row, 2), promotion: None });
     }
 
     moves

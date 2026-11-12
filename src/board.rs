@@ -28,6 +28,61 @@ pub struct Piece {
     pub kind: PieceType,
 }
 
+/// Which castling rights are still available.
+///
+/// Technically: four independent flags rather than a bit field, because a hobby
+/// engine values debuggability over four bytes. A right disappears permanently
+/// once the corresponding king or rook moves, or once that rook is captured --
+/// there is no way to regain one. The whole struct is copied into `Undo` so
+/// unmake can restore the exact previous state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CastlingRights {
+    pub white_kingside: bool,
+    pub white_queenside: bool,
+    pub black_kingside: bool,
+    pub black_queenside: bool,
+}
+
+impl CastlingRights {
+    /// No side may castle. The correct value for an empty board.
+    pub const NONE: CastlingRights = CastlingRights {
+        white_kingside: false,
+        white_queenside: false,
+        black_kingside: false,
+        black_queenside: false,
+    };
+
+    /// Every side may castle. The correct value for the starting position.
+    pub const ALL: CastlingRights = CastlingRights {
+        white_kingside: true,
+        white_queenside: true,
+        black_kingside: true,
+        black_queenside: true,
+    };
+
+    /// Returns whether `color` may castle toward the h-file.
+    ///
+    /// Technically: a match over two variants, resolving the color-specific flag
+    /// so callers never index a table or write a `match` of their own.
+    pub fn kingside(self, color: Color) -> bool {
+        match color {
+            Color::White => self.white_kingside,
+            Color::Black => self.black_kingside,
+        }
+    }
+
+    /// Returns whether `color` may castle toward the a-file.
+    ///
+    /// Technically: the queenside mirror of `kingside`, kept separate so callers
+    /// cannot accidentally swap the two flags.
+    pub fn queenside(self, color: Color) -> bool {
+        match color {
+            Color::White => self.white_queenside,
+            Color::Black => self.black_queenside,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidMove {
     OutOfBounds,
@@ -42,14 +97,29 @@ pub enum InvalidMove {
     PawnBlocked,
     PawnDiagonalNeedsCapture,
     PawnDoublePushFromWrongRank,
+    CastlingUnavailable,
+    EnPassantUnavailable,
 }
 
+/// Everything `make_move` must remember to reverse itself.
+///
+/// Technically: this is "what happened", not "what was asked". `Move` is the
+/// request; `Undo` is the receipt. It therefore has to record facts that the
+/// request cannot express -- which square the captured piece actually stood on
+/// (en passant captures land on a different square than the piece occupied) and
+/// where the rook started and ended (castling moves two pieces).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Undo {
     pub from: (usize, usize),
     pub to: (usize, usize),
     pub moved: Piece,
     pub captured: Option<Piece>,
+    /// Square the captured piece came from; equals `to` except for en passant.
+    pub captured_square: (usize, usize),
+    /// `(from, to)` for the rook, when the move was a castle.
+    pub castling_rook: Option<((usize, usize), (usize, usize))>,
+    pub castling: CastlingRights,
+    pub en_passant: Option<(usize, usize)>,
     pub side_to_move: Color,
 }
 
@@ -76,50 +146,180 @@ fn offset_ok(from: (usize, usize), to: (usize, usize), steps: &[(isize, isize)])
     })
 }
 
-/// Returns `true` if `color`'s king stands on a square the opponent attacks.
+/// Finds `color`'s king, if it is on the board.
 ///
-/// Technically: locates the king, then asks the pseudo-legal generator whether
-/// any enemy move lands on that square. Known imprecision: a pinned enemy piece
-/// still counts as giving check, because this never asks whether that piece
-/// could legally move. The error is fail-closed -- it can reject a legal move
-/// but cannot permit an illegal one -- and perft is what will expose it.
-pub fn in_check(board: &Board, color: Color) -> bool {
-    let mut king_pos = None;
-    'outer: for r in 0..8 {
+/// Technically: a linear scan of 64 squares. Doing this once per query is fine
+/// at the current scale; an engine that caches king squares per color would
+/// replace this with two indexed lookups.
+fn find_king(board: &Board, color: Color) -> Option<(usize, usize)> {
+    for r in 0..8 {
         for c in 0..8 {
-            if let Some(piece) = board.grid[r][c] {
-                if piece.color == color && piece.kind == PieceType::King {
-                    king_pos = Some((r, c));
-                    break 'outer;
-                }
+            if let Some(piece) = board.grid[r][c]
+                && piece.color == color
+                && piece.kind == PieceType::King
+            {
+                return Some((r, c));
             }
         }
     }
+    None
+}
 
-    let king_pos = match king_pos {
-        Some(pos) => pos,
-        None => return false,
-    };
+/// Returns `true` if `color` has a piece attacking `square`.
+///
+/// Technically: scans *outward from the target* rather than generating moves,
+/// so it allocates nothing. Pawns, knights and kings are checked as fixed
+/// offsets; sliders walk each ray and stop at the first piece, because only the
+/// nearest piece on a ray can attack.
+///
+/// This deliberately implements the FIDE definition of "attacked" (3.1.3): a
+/// piece attacks a square even if it is pinned and could not legally move
+/// there. That makes it correct both for check detection and for the castling
+/// rule, which forbids crossing an attacked square.
+pub fn is_attacked(board: &Board, square: (usize, usize), by: Color) -> bool {
+    let r = square.0 as isize;
+    let c = square.1 as isize;
 
-    let opponent_moves = crate::moves::generate_all_moves(board, color.opponent());
-    opponent_moves.iter().any(|mv| mv.to == king_pos)
+    // Pawns. White attacks one row above itself (row - 1), so a White attacker
+    // sits one row *below* the target. Black is the mirror image.
+    let pawn_row = if by == Color::White { r + 1 } else { r - 1 };
+    for dc in [-1isize, 1] {
+        let pc = c + dc;
+        if pawn_row >= 0 && pawn_row < 8 && pc >= 0 && pc < 8
+            && let Some(piece) = board.grid[pawn_row as usize][pc as usize]
+            && piece.color == by
+            && piece.kind == PieceType::Pawn
+        {
+            return true;
+        }
+    }
+
+    // Knights: fixed jumps, nothing can block them.
+    const KNIGHT: [(isize, isize); 8] = [
+        (2, 1), (2, -1), (-2, 1), (-2, -1),
+        (1, 2), (1, -2), (-1, 2), (-1, -2),
+    ];
+    for (dr, dc) in KNIGHT {
+        let nr = r + dr;
+        let nc = c + dc;
+        if nr >= 0 && nr < 8 && nc >= 0 && nc < 8
+            && let Some(piece) = board.grid[nr as usize][nc as usize]
+            && piece.color == by
+            && piece.kind == PieceType::Knight
+        {
+            return true;
+        }
+    }
+
+    // Kings: adjacent squares. This also makes "kings may not touch" fall out
+    // of check detection instead of needing a separate rule.
+    const KING: [(isize, isize); 8] = [
+        (0, 1), (0, -1), (1, 0), (-1, 0),
+        (1, 1), (1, -1), (-1, 1), (-1, -1),
+    ];
+    for (dr, dc) in KING {
+        let nr = r + dr;
+        let nc = c + dc;
+        if nr >= 0 && nr < 8 && nc >= 0 && nc < 8
+            && let Some(piece) = board.grid[nr as usize][nc as usize]
+            && piece.color == by
+            && piece.kind == PieceType::King
+        {
+            return true;
+        }
+    }
+
+    // Sliding pieces. Walk each ray from the target outward and stop at the
+    // first occupied square: a piece behind a blocker cannot attack the target.
+    const ORTHO: [(isize, isize); 4] = [(0, 1), (0, -1), (1, 0), (-1, 0)];
+    for (dr, dc) in ORTHO {
+        let mut nr = r + dr;
+        let mut nc = c + dc;
+        while nr >= 0 && nr < 8 && nc >= 0 && nc < 8 {
+            if let Some(piece) = board.grid[nr as usize][nc as usize] {
+                if piece.color == by && matches!(piece.kind, PieceType::Rook | PieceType::Queen) {
+                    return true;
+                }
+                break;
+            }
+            nr += dr;
+            nc += dc;
+        }
+    }
+
+    const DIAG: [(isize, isize); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+    for (dr, dc) in DIAG {
+        let mut nr = r + dr;
+        let mut nc = c + dc;
+        while nr >= 0 && nr < 8 && nc >= 0 && nc < 8 {
+            if let Some(piece) = board.grid[nr as usize][nc as usize] {
+                if piece.color == by && matches!(piece.kind, PieceType::Bishop | PieceType::Queen) {
+                    return true;
+                }
+                break;
+            }
+            nr += dr;
+            nc += dc;
+        }
+    }
+
+    false
+}
+
+/// Returns `true` if `color`'s king stands on an attacked square.
+///
+/// Technically: locates the king and delegates to `is_attacked`. A missing king
+/// reports "not in check" rather than panicking, which keeps hand-built test
+/// positions without a king usable.
+pub fn in_check(board: &Board, color: Color) -> bool {
+    match find_king(board, color) {
+        Some(king) => is_attacked(board, king, color.opponent()),
+        None => false,
+    }
+}
+
+/// Returns `true` if this move is a castle: a king advancing two files.
+///
+/// Technically: derived rather than stored, because no other legal move moves a
+/// king two columns, so the test is exact. That keeps `Move` a plain
+/// `{from, to, promotion}` and avoids a new field at every construction site.
+fn is_castling_move(moving: Piece, mv: &Move) -> bool {
+    moving.kind == PieceType::King && (mv.to.1 as isize - mv.from.1 as isize).abs() == 2
+}
+
+/// Returns `true` if this move is an en passant capture.
+///
+/// Technically: also derived. A pawn moving diagonally onto an *empty* square
+/// can only be en passant, since a normal diagonal pawn move requires a piece to
+/// capture. Must be called after validation, which is what guarantees the target
+/// square really is the recorded en passant square.
+fn is_en_passant_move(board: &Board, moving: Piece, mv: &Move) -> bool {
+    moving.kind == PieceType::Pawn
+        && mv.to.1 != mv.from.1
+        && board.grid[mv.to.0][mv.to.1].is_none()
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Board {
     pub grid: [[Option<Piece>; 8]; 8],
     pub side_to_move: Color,
+    pub castling: CastlingRights,
+    pub en_passant: Option<(usize, usize)>,
 }
 
 impl Board {
-    /// Creates a board with no pieces and White to move.
+    /// Creates a board with no pieces, no castling rights and White to move.
     ///
     /// Technically: the canonical zero value for hand-built test and puzzle
-    /// positions. `side_to_move` defaults to White and callers override it;
-    /// `new()` is built on top of this so only one place constructs the empty
-    /// grid.
+    /// positions. `new()` is built on top of this so only one place constructs
+    /// the empty grid.
     pub fn empty() -> Self {
-        Board { grid: [[None; 8]; 8], side_to_move: Color::White }
+        Board {
+            grid: [[None; 8]; 8],
+            side_to_move: Color::White,
+            castling: CastlingRights::NONE,
+            en_passant: None,
+        }
     }
 
     /// Creates the standard starting position with White to move.
@@ -127,7 +327,8 @@ impl Board {
     /// Technically: two back ranks and two pawn ranks, with row 0 as rank 8
     /// (Black's home) and row 7 as rank 1 (White's home). The back-rank table is
     /// written king-and-queen-inward from the outside so both colors share one
-    /// definition instead of two mirrored literals that could drift apart.
+    /// definition instead of two mirrored literals that could drift apart. All
+    /// castling rights are live and there is no en passant target.
     pub fn new() -> Self {
         let back_rank = [
             PieceType::Rook, PieceType::Knight, PieceType::Bishop,
@@ -149,6 +350,7 @@ impl Board {
             board.grid[7][file] = Some(Piece { color: Color::White, kind: *kind });
         }
 
+        board.castling = CastlingRights::ALL;
         board
     }
 
@@ -157,9 +359,12 @@ impl Board {
     /// Technically: splits the displacement into a step count per axis and
     /// requires both axes to agree on that count. That `kr != kc` test is what
     /// stops an off-diagonal target from being accepted, since a single axis
-    /// alone cannot distinguish a real ray from an unrelated square. Squares
-    /// strictly between `from` and `to` are then checked for occupancy; the
-    /// destination itself is validated by the caller.
+    /// alone cannot distinguish a real ray from an unrelated square. An
+    /// orthogonal direction additionally requires zero displacement on the
+    /// perpendicular axis -- without that test the ignored axis contributes a
+    /// step count of zero and a rook could be "validated" toward a square on a
+    /// different rank. Squares strictly between `from` and `to` are then checked
+    /// for occupancy; the destination itself is validated by the caller.
     fn validate_slide(&self, mv: &Move, dirs: &[(isize, isize)]) -> Result<(), InvalidMove> {
         let drt = mv.to.0 as isize - mv.from.0 as isize;
         let dct = mv.to.1 as isize - mv.from.1 as isize;
@@ -170,6 +375,8 @@ impl Board {
             let kc = if dc == 0 { 0 } else if dct % dc == 0 { dct / dc } else { continue };
             if kr <= 0 && kc <= 0 { continue; }
             if dr != 0 && dc != 0 && kr != kc { continue; }
+            if dr == 0 && drt != 0 { continue; }
+            if dc == 0 && dct != 0 { continue; }
             if kr < 0 || kc < 0 { continue; }
 
             let k = if dr != 0 { kr } else { kc };
@@ -184,14 +391,51 @@ impl Board {
         Err(InvalidMove::BadGeometry)
     }
 
-    /// Checks a pawn move: single push, double push, and diagonal captures.
+    /// Checks a castle: rights, rook presence, and a clear path.
+    ///
+    /// Technically: structural only. It deliberately does not ask whether the
+    /// king is in check or crosses an attacked square -- `make_move` is not
+    /// allowed to reason about safety, because the legality filter asks its
+    /// questions *by making moves*. Those two rules are enforced there instead.
+    fn validate_castling(&self, mv: &Move, king: Piece) -> Result<(), InvalidMove> {
+        let home_row = if king.color == Color::White { 7 } else { 0 };
+
+        // Castling is only ever generated from and to the home rank.
+        if mv.from != (home_row, 4) || mv.to.0 != home_row {
+            return Err(InvalidMove::BadGeometry);
+        }
+
+        let (allowed, rook_col, gap): (bool, usize, &[usize]) = match mv.to.1 {
+            6 => (self.castling.kingside(king.color), 7, &[5, 6]),
+            2 => (self.castling.queenside(king.color), 0, &[1, 2, 3]),
+            _ => return Err(InvalidMove::BadGeometry),
+        };
+
+        if !allowed { return Err(InvalidMove::CastlingUnavailable); }
+
+        match self.grid[home_row][rook_col] {
+            Some(piece) if piece.color == king.color && piece.kind == PieceType::Rook => {}
+            _ => return Err(InvalidMove::CastlingUnavailable),
+        }
+
+        for &col in gap {
+            if self.grid[home_row][col].is_some() {
+                return Err(InvalidMove::PathBlocked);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Checks a pawn move: single push, double push, diagonal captures and en passant.
     ///
     /// Technically: pawns are the only piece whose direction depends on color
     /// and whose capture squares are not their push squares. A straight move
     /// rejects any occupant (a pawn cannot capture forward); a diagonal move
-    /// requires an enemy occupant. The double push additionally requires the
-    /// home rank and a clear intermediate square, whereas its landing square is
-    /// covered by the shared `OwnPieceAtTo` check in `validate`.
+    /// requires either an enemy occupant or a legitimate en passant target. The
+    /// en passant branch additionally verifies that the pawn to be removed is
+    /// really there, so a stale `en_passant` field cannot produce a phantom
+    /// capture.
     fn validate_pawn(&self, mv: &Move, p: Piece) -> Result<(), InvalidMove> {
         let forward: isize = if p.color == Color::White { -1 } else { 1 };
         let home: usize = if p.color == Color::White { 6 } else { 1 };
@@ -210,8 +454,18 @@ impl Board {
         }
 
         if dc.abs() != 1 || dr != forward { return Err(InvalidMove::BadGeometry); }
+
         match self.grid[mv.to.0][mv.to.1] {
-            Some(t) if t.color != p.color => Ok(()),
+            Some(target) if target.color != p.color => Ok(()),
+            None if self.en_passant == Some(mv.to) => {
+                // The captured pawn stands beside the mover, not on `to`.
+                let captured = self.grid[mv.from.0][mv.to.1];
+                match captured {
+                    Some(t) if t.color != p.color && t.kind == PieceType::Pawn => Ok(()),
+                    _ => Err(InvalidMove::EnPassantUnavailable),
+                }
+            }
+            None => Err(InvalidMove::EnPassantUnavailable),
             _ => Err(InvalidMove::PawnDiagonalNeedsCapture),
         }
     }
@@ -234,6 +488,12 @@ impl Board {
             && target.color == moving.color
         {
             return Err(InvalidMove::OwnPieceAtTo);
+        }
+
+        // Castle before geometry: a two-file king move is not one of the eight
+        // single-step offsets, so the normal king path would reject it.
+        if is_castling_move(moving, mv) {
+            return self.validate_castling(mv, moving);
         }
 
         let promo_rank = if moving.color == Color::White { 0 } else { 7 };
@@ -281,40 +541,149 @@ impl Board {
         }
     }
 
+    /// Drops any castling right that depends on `sq` holding a rook.
+    ///
+    /// Technically: called for both the origin square (a rook leaving home) and
+    /// the captured square (a rook removed from home). It is idempotent, so
+    /// calling it for ordinary moves that touch nothing relevant is free.
+    fn revoke_castling_for_square(&mut self, sq: (usize, usize)) {
+        match sq {
+            (7, 0) => self.castling.white_queenside = false,
+            (7, 7) => self.castling.white_kingside = false,
+            (0, 0) => self.castling.black_queenside = false,
+            (0, 7) => self.castling.black_kingside = false,
+            _ => {}
+        }
+    }
+
     /// Applies `mv`, returning the record needed to reverse it.
     ///
     /// Validates before mutating, so a rejected move leaves the board untouched.
     /// This checks that the move is coherent with the movement rules and this
     /// position; whether it is *safe* is the legality filter's job, not this
     /// function's -- the filter works by making a move and asking.
+    ///
+    /// Technically: handles the three ways a move is more than "pick up and put
+    /// down" -- a capture may be on a different square than `to` (en passant), a
+    /// promotion changes the piece kind in flight, and a castle moves a second
+    /// piece. Every one of those facts is written into `Undo` here, because
+    /// `unmake_move` is not permitted to re-derive them.
     pub fn make_move(&mut self, mv: &Move) -> Result<Undo, InvalidMove> {
         self.validate(mv)?;
 
         let prev_side = self.side_to_move;
-        let moved = self.grid[mv.from.0][mv.from.1].expect("validated above");
-        let captured = self.grid[mv.to.0][mv.to.1];
+        let prev_castling = self.castling;
+        let prev_en_passant = self.en_passant;
 
+        let moved = self.grid[mv.from.0][mv.from.1].expect("validated above");
+
+        // En passant removes a pawn that is beside the mover, not on `to`.
+        let captured_square = if is_en_passant_move(self, moved, mv) {
+            (mv.from.0, mv.to.1)
+        } else {
+            mv.to
+        };
+        let captured = self.grid[captured_square.0][captured_square.1];
+
+        self.grid[captured_square.0][captured_square.1] = None;
         self.grid[mv.from.0][mv.from.1] = None;
         self.grid[mv.to.0][mv.to.1] = Some(match mv.promotion {
             Some(kind) => Piece { color: moved.color, kind },
             None => moved,
         });
+
+        // Castling also moves a rook. The corner is implied by the direction.
+        let castling_rook = if is_castling_move(moved, mv) {
+            let home_row = mv.from.0;
+            let (rook_from, rook_to) = if mv.to.1 > mv.from.1 {
+                ((home_row, 7), (home_row, 5))
+            } else {
+                ((home_row, 0), (home_row, 3))
+            };
+            self.grid[rook_to.0][rook_to.1] = self.grid[rook_from.0][rook_from.1].take();
+            Some((rook_from, rook_to))
+        } else {
+            None
+        };
+
+        // Rights are lost by moving the king, moving a rook off its home square,
+        // or capturing an enemy rook on its home square.
+        if moved.kind == PieceType::King {
+            match moved.color {
+                Color::White => {
+                    self.castling.white_kingside = false;
+                    self.castling.white_queenside = false;
+                }
+                Color::Black => {
+                    self.castling.black_kingside = false;
+                    self.castling.black_queenside = false;
+                }
+            }
+        }
+        self.revoke_castling_for_square(mv.from);
+        self.revoke_castling_for_square(captured_square);
+
+        // The en passant target is the square a double-pushed pawn skipped over.
+        self.en_passant = if moved.kind == PieceType::Pawn
+            && (mv.to.0 as isize - mv.from.0 as isize).abs() == 2
+        {
+            Some(((mv.from.0 + mv.to.0) / 2, mv.from.1))
+        } else {
+            None
+        };
+
         self.side_to_move = prev_side.opponent();
 
-        Ok(Undo { from: mv.from, to: mv.to, moved, captured, side_to_move: prev_side })
+        Ok(Undo {
+            from: mv.from,
+            to: mv.to,
+            moved,
+            captured,
+            captured_square,
+            castling_rook,
+            castling: prev_castling,
+            en_passant: prev_en_passant,
+            side_to_move: prev_side,
+        })
     }
 
     /// Reverses a move previously applied by `make_move`.
     ///
     /// Technically: a mechanical inverse. It restores the moving piece, the
-    /// captured piece, and `side_to_move` from the `Undo` record, and contains
-    /// no chess knowledge -- no rule checks, no "was this a pawn". Any chess
-    /// reasoning unmake appears to need should have been captured in the record
-    /// at make time instead.
+    /// captured piece **on the square it actually occupied**, the rook if the
+    /// move was a castle, and the castling/en passant bookkeeping, then hands
+    /// the turn back. It contains no chess knowledge -- no rule checks, no
+    /// "was this a pawn". Any chess reasoning unmake appears to need should have
+    /// been captured in the record at make time instead.
     pub fn unmake_move(&mut self, undo: &Undo) {
+        self.grid[undo.to.0][undo.to.1] = None;
+        self.grid[undo.captured_square.0][undo.captured_square.1] = undo.captured;
         self.grid[undo.from.0][undo.from.1] = Some(undo.moved);
-        self.grid[undo.to.0][undo.to.1] = undo.captured;
+
+        if let Some((rook_from, rook_to)) = undo.castling_rook {
+            self.grid[rook_from.0][rook_from.1] = self.grid[rook_to.0][rook_to.1].take();
+        }
+
+        self.castling = undo.castling;
+        self.en_passant = undo.en_passant;
         self.side_to_move = undo.side_to_move;
+    }
+
+    /// Returns `true` if this castle must be rejected on safety grounds.
+    ///
+    /// Technically: the two castling rules that cannot be expressed by "make the
+    /// move, then ask if the king is attacked". The king may not castle out of
+    /// check, and may not cross an attacked square -- the latter is invisible
+    /// after the move because the king has already passed through it. Checked
+    /// against the square the king steps over: f1/g1 or d1/c1 depending on side.
+    fn castling_is_forbidden(&self, mv: &Move) -> bool {
+        let Some(moving) = self.grid[mv.from.0][mv.from.1] else { return false };
+        if !is_castling_move(moving, mv) { return false; }
+
+        if in_check(self, moving.color) { return true; }
+
+        let transit = (mv.from.0, (mv.from.1 + mv.to.1) / 2);
+        is_attacked(self, transit, moving.color.opponent())
     }
 
     /// Generates every move the side to move may legally play.
@@ -327,6 +696,10 @@ impl Board {
     /// move safe?" requires making it, and cloning the board per candidate would
     /// allocate once per move -- fatal inside a search tree.
     ///
+    /// Castling needs one extra gate before that loop, because two of its rules
+    /// concern squares the king has already left by the time the board is
+    /// inspected: it may not start in check or pass through an attacked square.
+    ///
     /// Takes `&mut self` rather than `&self` for that same reason. Takes no
     /// `color` argument because `make_move` validates against
     /// `self.side_to_move`; a parameter could disagree with that field and cause
@@ -338,6 +711,10 @@ impl Board {
         let mut legal = Vec::with_capacity(pseudo.len());
 
         for mv in pseudo {
+            if self.castling_is_forbidden(&mv) {
+                continue;
+            }
+
             // A rejected candidate never mutated the board, because `make_move`
             // validates before writing. Skipping without unmaking is therefore
             // safe, and is the payoff for keeping validation pure.
