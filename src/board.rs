@@ -6,6 +6,11 @@ use crate::moves::Move;
 pub enum Color { White, Black }
 
 impl Color {
+    /// Returns the opposite color.
+    ///
+    /// Technically: a two-variant exhaustive match, so it is total and cannot
+    /// fail. Used to swap `side_to_move` after a move and to name the attacking
+    /// side when asking whether a square is defended.
     pub fn opponent(self) -> Color {
         match self {
             Color::White => Color::Black,
@@ -48,10 +53,21 @@ pub struct Undo {
     pub side_to_move: Color,
 }
 
+/// Returns `true` only when both coordinates index a real 8x8 board square.
+///
+/// Technically: the coordinates are `usize`, so negative values are not
+/// representable. This exists because generators compute coordinates in `isize`
+/// and a value below zero cast back to `usize` wraps to a huge number, which
+/// would index out of bounds. Rejecting is always preferable to panicking.
 fn in_bounds(sq: (usize, usize)) -> bool {
     sq.0 < 8 && sq.1 < 8
 }
 
+/// Returns `true` when `to` is exactly one fixed step away from `from`.
+///
+/// Technically: the arithmetic happens in `isize` so a negative result cannot
+/// wrap, and the destination is compared as a tuple. Used for knight and king
+/// moves, which have no path to clear -- only bounds and a single offset apply.
 fn offset_ok(from: (usize, usize), to: (usize, usize), steps: &[(isize, isize)]) -> bool {
     steps.iter().any(|&(dr, dc)| {
         let r = from.0 as isize + dr;
@@ -60,6 +76,13 @@ fn offset_ok(from: (usize, usize), to: (usize, usize), steps: &[(isize, isize)])
     })
 }
 
+/// Returns `true` if `color`'s king stands on a square the opponent attacks.
+///
+/// Technically: locates the king, then asks the pseudo-legal generator whether
+/// any enemy move lands on that square. Known imprecision: a pinned enemy piece
+/// still counts as giving check, because this never asks whether that piece
+/// could legally move. The error is fail-closed -- it can reject a legal move
+/// but cannot permit an illegal one -- and perft is what will expose it.
 pub fn in_check(board: &Board, color: Color) -> bool {
     let mut king_pos = None;
     'outer: for r in 0..8 {
@@ -89,10 +112,22 @@ pub struct Board {
 }
 
 impl Board {
+    /// Creates a board with no pieces and White to move.
+    ///
+    /// Technically: the canonical zero value for hand-built test and puzzle
+    /// positions. `side_to_move` defaults to White and callers override it;
+    /// `new()` is built on top of this so only one place constructs the empty
+    /// grid.
     pub fn empty() -> Self {
         Board { grid: [[None; 8]; 8], side_to_move: Color::White }
     }
 
+    /// Creates the standard starting position with White to move.
+    ///
+    /// Technically: two back ranks and two pawn ranks, with row 0 as rank 8
+    /// (Black's home) and row 7 as rank 1 (White's home). The back-rank table is
+    /// written king-and-queen-inward from the outside so both colors share one
+    /// definition instead of two mirrored literals that could drift apart.
     pub fn new() -> Self {
         let back_rank = [
             PieceType::Rook, PieceType::Knight, PieceType::Bishop,
@@ -117,6 +152,14 @@ impl Board {
         board
     }
 
+    /// Checks a bishop/rook/queen move against a fixed set of ray directions.
+    ///
+    /// Technically: splits the displacement into a step count per axis and
+    /// requires both axes to agree on that count. That `kr != kc` test is what
+    /// stops an off-diagonal target from being accepted, since a single axis
+    /// alone cannot distinguish a real ray from an unrelated square. Squares
+    /// strictly between `from` and `to` are then checked for occupancy; the
+    /// destination itself is validated by the caller.
     fn validate_slide(&self, mv: &Move, dirs: &[(isize, isize)]) -> Result<(), InvalidMove> {
         let drt = mv.to.0 as isize - mv.from.0 as isize;
         let dct = mv.to.1 as isize - mv.from.1 as isize;
@@ -141,6 +184,14 @@ impl Board {
         Err(InvalidMove::BadGeometry)
     }
 
+    /// Checks a pawn move: single push, double push, and diagonal captures.
+    ///
+    /// Technically: pawns are the only piece whose direction depends on color
+    /// and whose capture squares are not their push squares. A straight move
+    /// rejects any occupant (a pawn cannot capture forward); a diagonal move
+    /// requires an enemy occupant. The double push additionally requires the
+    /// home rank and a clear intermediate square, whereas its landing square is
+    /// covered by the shared `OwnPieceAtTo` check in `validate`.
     fn validate_pawn(&self, mv: &Move, p: Piece) -> Result<(), InvalidMove> {
         let forward: isize = if p.color == Color::White { -1 } else { 1 };
         let home: usize = if p.color == Color::White { 6 } else { 1 };
@@ -165,6 +216,15 @@ impl Board {
         }
     }
 
+    /// Checks that `mv` is coherent with the movement rules for this position.
+    ///
+    /// Technically: a pure function -- it borrows `self` immutably and never
+    /// mutates. That purity is precisely what lets `make_move` validate fully
+    /// before touching any state, so a rejected move provably leaves the board
+    /// untouched. It checks promotion coherence too, because `Option<PieceType>`
+    /// can express illegal promotions (`Some(Pawn)`, `Some(King)`). It
+    /// deliberately says nothing about king safety; that belongs to
+    /// `generate_legal_moves`.
     fn validate(&self, mv: &Move) -> Result<(), InvalidMove> {
         if !in_bounds(mv.from) || !in_bounds(mv.to) { return Err(InvalidMove::OutOfBounds); }
 
@@ -244,14 +304,65 @@ impl Board {
         Ok(Undo { from: mv.from, to: mv.to, moved, captured, side_to_move: prev_side })
     }
 
+    /// Reverses a move previously applied by `make_move`.
+    ///
+    /// Technically: a mechanical inverse. It restores the moving piece, the
+    /// captured piece, and `side_to_move` from the `Undo` record, and contains
+    /// no chess knowledge -- no rule checks, no "was this a pawn". Any chess
+    /// reasoning unmake appears to need should have been captured in the record
+    /// at make time instead.
     pub fn unmake_move(&mut self, undo: &Undo) {
         self.grid[undo.from.0][undo.from.1] = Some(undo.moved);
         self.grid[undo.to.0][undo.to.1] = undo.captured;
         self.side_to_move = undo.side_to_move;
     }
+
+    /// Generates every move the side to move may legally play.
+    ///
+    /// Technically: takes the pseudo-legal list and keeps only moves that do not
+    /// leave the mover's own king attacked. Each candidate is played with
+    /// `make_move`, interrogated with `in_check`, then reverted with
+    /// `unmake_move`, so the board is byte-identical on entry and exit. This
+    /// loop is the entire reason the `Undo` record exists: answering "is this
+    /// move safe?" requires making it, and cloning the board per candidate would
+    /// allocate once per move -- fatal inside a search tree.
+    ///
+    /// Takes `&mut self` rather than `&self` for that same reason. Takes no
+    /// `color` argument because `make_move` validates against
+    /// `self.side_to_move`; a parameter could disagree with that field and cause
+    /// every candidate to be rejected as `WrongColor`. When a parameter must
+    /// always equal a field, derive it from the field.
+    pub fn generate_legal_moves(&mut self) -> Vec<Move> {
+        let color = self.side_to_move;
+        let pseudo = crate::moves::generate_all_moves(self, color);
+        let mut legal = Vec::with_capacity(pseudo.len());
+
+        for mv in pseudo {
+            // A rejected candidate never mutated the board, because `make_move`
+            // validates before writing. Skipping without unmaking is therefore
+            // safe, and is the payoff for keeping validation pure.
+            let undo = match self.make_move(&mv) {
+                Ok(undo) => undo,
+                Err(_) => continue,
+            };
+
+            if !in_check(self, color) {
+                legal.push(mv);
+            }
+
+            self.unmake_move(&undo);
+        }
+
+        legal
+    }
 }
 
 impl fmt::Display for Board {
+    /// Renders the position as an 8x8 grid with Unicode pieces, rank 8 first.
+    ///
+    /// Technically: row 0 is printed as rank 8 so the output reads like a real
+    /// board. The trailing file labels are emitted without a newline so the
+    /// result composes cleanly with `println!`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for rank in 0..8 {
             write!(f, "{} ", 8 - rank)?;

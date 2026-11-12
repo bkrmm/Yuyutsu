@@ -1,5 +1,10 @@
 use crate::board::{Board, Color, PieceType, Piece};
 
+/// A single move, independent of the board it was generated from.
+///
+/// Technically: `from` and `to` are `(row, column)` pairs on the 8x8 grid, and
+/// `promotion` is `Some` only when a pawn lands on the far rank. `Copy` keeps it
+/// cheap to pass around a search; `PartialEq`/`Eq` let tests assert on moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Move {
     pub from: (usize, usize),
@@ -7,6 +12,11 @@ pub struct Move {
     pub promotion : Option<PieceType>, //none for non-pawn moves
 }
 
+/// Dispatches to the generator matching this piece's kind.
+///
+/// Technically: the moving color is read from `piece.color` rather than taken as
+/// a separate argument, so a move list can never disagree with the piece it was
+/// generated from.
 pub fn generate_pseudo_moves(board: &Board, row: usize, column: usize, piece: Piece) -> Vec<Move> {
     match piece.kind {
         PieceType::Pawn => generate_pawn_moves(board, row, column, piece.color),
@@ -18,6 +28,13 @@ pub fn generate_pseudo_moves(board: &Board, row: usize, column: usize, piece: Pi
     }
 }
 
+/// Generates every pseudo-legal move for `color`.
+///
+/// Technically: scans all 64 squares in row-major order and extends the result
+/// with each matching piece's moves. The resulting order is an implementation
+/// detail of this scan -- never index into this list expecting a particular
+/// move, because a change to the loop or a generator's push order silently
+/// reorders it.
 pub fn generate_all_moves(board: &Board, color: Color) -> Vec<Move> {
     let mut moves = vec![];
     for r in 0..8 {
@@ -32,7 +49,15 @@ pub fn generate_all_moves(board: &Board, color: Color) -> Vec<Move> {
     moves
 }
 
-//pawn
+/// Generates pseudo-legal pawn moves: single push, double push, and captures.
+///
+/// Technically: `forward` is -1 for White because row 0 is rank 8, so advancing
+/// decreases the row. The target rank is computed in `isize` and bounds-checked
+/// *before* conversion, because a pawn already sitting on the last rank would
+/// otherwise wrap to a huge `usize` and index out of bounds. The double push
+/// needs two separate occupancy tests: the intermediate square and the landing
+/// square are different squares, and checking only one of them was a real bug.
+/// Promotion fans out into four pieces for both pushes and captures.
 pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     let forward: isize = if color == Color::White {-1} else {1};
     let promo_rank: isize  = if color == Color::White {0} else {7};
@@ -90,7 +115,11 @@ pub fn generate_pawn_moves(board: &Board, row: usize, column: usize, color: Colo
     moves
 }
 
-//Knight
+/// Generates pseudo-legal knight moves from one square.
+///
+/// Technically: knights jump, so no path check is needed -- only board bounds
+/// and whether the destination holds a friendly piece. The eight offsets are
+/// listed exhaustively rather than derived, which keeps the rule visible.
 pub fn generate_knight_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     const STEPS: [(isize, isize); 8] = [
         (2, 1), (2, -1), (-2, 1), (-2, -1),
@@ -118,7 +147,12 @@ pub fn generate_knight_moves(board: &Board, row: usize, column: usize, color: Co
     moves
 }
 
-//Bishop
+/// Generates pseudo-legal bishop moves along the four diagonals.
+///
+/// Technically: walks each ray outward until it leaves the board, stopping after
+/// the first occupied square. That occupant is appended only when it is an enemy
+/// piece -- the capture case -- which is what makes the ray terminate correctly
+/// instead of passing through a blocker.
 pub fn generate_bishop_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     const DIRS: [(isize, isize); 4] = [
         (1, 1), (1, -1), (-1, 1), (-1, -1),
@@ -151,7 +185,11 @@ pub fn generate_bishop_moves(board: &Board, row: usize, column: usize, color: Co
     moves
 }
 
-//Rook
+/// Generates pseudo-legal rook moves along the four orthogonals.
+///
+/// Technically: the same ray walk as the bishop with a different direction
+/// table. It stops after the first occupied square and captures only enemy
+/// pieces, so a friendly blocker terminates the ray without emitting a move.
 pub fn generate_rook_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     const DIRS: [(isize, isize); 4] = [
         (0, 1), (0, -1), (1, 0), (-1, 0),
@@ -184,14 +222,23 @@ pub fn generate_rook_moves(board: &Board, row: usize, column: usize, color: Colo
     moves
 }
 
-//Queen
+/// Generates pseudo-legal queen moves.
+///
+/// Technically: a queen is exactly a rook plus a bishop, so this concatenates
+/// the two generators instead of duplicating the ray-walking code. Any future
+/// fix to ray handling lands in one place.
 pub fn generate_queen_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     let mut moves = generate_bishop_moves(board, row, column, color);
     moves.extend(generate_rook_moves(board, row, column, color));
     moves
 }
 
-//King
+/// Generates pseudo-legal king moves from one square.
+///
+/// Technically: a single step in each of eight directions. Two deliberate gaps:
+/// no castling yet, and no check-safety -- a king may be generated onto an
+/// attacked square. Both are resolved elsewhere: castling by a future generator,
+/// check-safety by `Board::generate_legal_moves`, which removes those moves.
 pub fn generate_king_moves(board: &Board, row: usize, column: usize, color: Color) -> Vec<Move> {
     const STEPS: [(isize, isize); 8] = [
         (0, 1), (0, -1), (1, 0), (-1, 0),
