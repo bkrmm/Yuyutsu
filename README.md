@@ -6,9 +6,9 @@ Yuyutsu was the one Kaurava who chose to fight for the side he judged right.
 
 ## Status
 
-The rules layer is solid and verified. There is no search yet, so the engine does
-not play chess — it can only enumerate and apply legal moves, then report the
-resulting game state.
+The rules layer is solid and verified, and `cargo run` starts a terminal REPL.
+There is no search yet, so the engine does not choose moves: the interface is a
+hot-seat board and rule checker, with both sides entered by hand.
 
 **Working**
 
@@ -30,6 +30,8 @@ resulting game state.
   insufficient-material set
 - `Game` / `GameState` reporting ongoing, checkmate, stalemate, or a typed
   `DrawReason`, with checkmate and stalemate taking precedence
+- Terminal REPL with coordinate moves, promotion suffixes, legal-move listing,
+  state display, undo, and new game
 
 **Not implemented**
 
@@ -38,14 +40,14 @@ resulting game state.
 - Complete dead-position analysis; blocked-pawn positions are not detected
 - Search, evaluation, MCTS
 - Bitboards
-- A user interface; `cargo run` is a smoke test that prints one move
+- A UCI protocol for standard chess GUIs, and a graphical interface
 
 ## Getting started
 
 ```sh
-cargo run                # print the legal move count, play one move, show the board
-cargo test               # 41 tests: rules, agreement, perft to depth 4, special moves, draws
-cargo test --release     # 43 tests: adds start-position perft 5-6 and Kiwipete 4
+cargo run                # start the terminal REPL
+cargo test               # 55 tests: rules, perft to depth 4, draws, terminal interface
+cargo test --release     # 57 tests: adds start-position perft 5-6 and Kiwipete 4
 ```
 
 No dependencies. Rust 2024 edition.
@@ -57,13 +59,15 @@ No dependencies. Rust 2024 edition.
 | `src/board.rs` | Board, pieces, castling rights, en passant target, halfmove clock, `Undo`, `make_move`/`unmake_move`, validation, attack detection, legality filter, repetition key, material draw check |
 | `src/game.rs` | `Game`, `GameState`, `DrawReason`, repetition history and terminal-state evaluation |
 | `src/moves.rs` | `Move` and the per-piece pseudo-legal generators, including castling and en passant |
+| `src/ui.rs` | Command parsing, `Session` with its undo stack, status labels, and help text |
 | `src/lib.rs` | Library root, so `tests/` can link the engine |
-| `src/main.rs` | Smoke-test binary |
+| `src/main.rs` | Terminal read-eval-print loop |
 | `tests/common/mod.rs` | Shared FEN parser, position builder, and perft |
 | `tests/agreement.rs` | Generator/validator agreement and make/unmake round trips |
 | `tests/perft.rs` | Perft oracle for the start position and Kiwipete, plus targeted position tests |
 | `tests/special_moves.rs` | Castling and en passant edge cases in isolation |
 | `tests/draws.rs` | Halfmove clock, fifty-move, repetition identity, and insufficient material |
+| `tests/ui.rs` | Command parsing, session behavior, and terminal-state gating |
 
 ### Coordinates
 
@@ -74,7 +78,7 @@ internalising before reading the generators.
 
 ## Design
 
-Five decisions shape the codebase:
+Six decisions shape the codebase:
 
 **Move generation is pure.** Generators borrow the board and return moves; they
 never mutate. `make_move` is the only mutator, and it validates fully *before*
@@ -111,7 +115,20 @@ board. The key is exact, not a Zobrist hash: grid, side to move, castling rights
 and the en passant target *only when a legal capture exists*. Hashing would be
 faster, but a collision here would silently turn a win into a draw. `GameState`
 treats claimable draws as terminal and reports the reason; full FIDE claim
-handling belongs to a UI, not to search.
+handling belongs to a UI, not to search, and the current terminal simply locks
+the position once a claim becomes available.
+
+**The interface is a separate layer.** `main.rs` owns stdin, stdout, and the
+prompt. `ui::Session` owns the `Game` plus the undo receipts, parses one line, and
+returns an `Action` describing what happened; it prints nothing. That split makes
+the REPL rules integration-testable without capturing terminal output.
+
+Moves are entered in coordinate notation (`e2e4`, `e7e8q`, `e1g1`), which maps
+directly onto `Move` and needs no ambiguous SAN disambiguation. The session
+checks the generated legal list before playing, because `make_move` validates
+geometry but not the generic "does this expose my own king?" rule. After a
+terminal state the interface refuses further moves, while `Game` remains
+permissive for search.
 
 ### Attack detection
 
@@ -171,14 +188,20 @@ a third occurrence and disappears again on unplay. The repetition-key tests
 include the FIDE detail that an en passant target distinguishes positions only
 when the capture is actually legal, including the pinned-pawn case.
 
+`tests/ui.rs` tests the interface layer without touching stdin or stdout. It
+covers command aliases, coordinate parsing and formatting, promotion suffixes,
+unknown commands and malformed moves, rejection of a pinned move that geometry
+alone would accept, undo as a true stack, `new` clearing the old undo stack,
+checkmate and fifty-move lockout, and the human-readable status labels.
+
 ## Roadmap
 
 Ordered by dependency rather than by visibility — each item is what the next one
 needs.
 
 1. Switch the board to a bitboard representation
-2. Add a UCI or terminal input layer
-3. Build the MCTS search
+2. Build the MCTS search
+3. Add a UCI protocol for standard chess GUIs
 
 The remaining draw-rule refinements — FIDE claim semantics, automatic fivefold
 and seventy-five-move draws, and full dead-position detection — are deliberately
