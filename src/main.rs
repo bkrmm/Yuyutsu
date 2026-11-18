@@ -1,29 +1,31 @@
-use yuyutsu::board::{self, in_check};
+use yuyutsu::game::Game;
 
-/// Entry point: plays the first legal move from the starting position and shows
-/// the resulting board.
+/// Entry point: reports the game state, plays the first legal move from the
+/// starting position, and shows the resulting board.
 ///
-/// Technically: this is a smoke-test harness, not a user interface. It uses
-/// `generate_legal_moves` rather than the raw pseudo-legal generator, so the
-/// move it picks can no longer strand its own king. The empty-list arm is a real
-/// outcome -- checkmate or stalemate -- and is reported as such instead of being
-/// silently skipped.
+/// Technically: this is a smoke-test harness, not a user interface. `Game`
+/// owns the repetition history and the halfmove clock, so `state` answers
+/// checkmate, stalemate, and every draw rule in one place. The binary no longer
+/// re-derives terminal state from an empty move list, which is exactly the
+/// duplication `GameState` exists to remove.
 fn main() {
-    let mut b = board::Board::new();
+    let mut game = Game::new();
 
-    let moves_list = b.generate_legal_moves();
-    println!("{} legal moves for {:?}", moves_list.len(), b.side_to_move);
+    let moves_list = game.legal_moves();
+    println!(
+        "{} legal moves for {:?}",
+        moves_list.len(),
+        game.board().side_to_move
+    );
 
     match moves_list.first() {
-        Some(mv) => match b.make_move(mv) {
+        Some(mv) => match game.play(mv) {
             Ok(_undo) => {}
             Err(e) => println!("make_move rejected {mv:?}: {e:?}"),
         },
-        None => {
-            let state = if in_check(&b, b.side_to_move) { "checkmate" } else { "stalemate" };
-            println!("no legal moves: {state}");
-        }
+        None => println!("no legal moves"),
     }
 
-    println!("{b}");
+    println!("state: {:?}", game.state());
+    println!("{}", game.board());
 }

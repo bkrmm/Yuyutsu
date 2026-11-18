@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::moves::Move;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Color { White, Black }
 
 impl Color {
@@ -19,10 +19,10 @@ impl Color {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PieceType { Pawn, Knight, Bishop, Rook, Queen, King }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Piece {
     pub color: Color,
     pub kind: PieceType,
@@ -35,7 +35,7 @@ pub struct Piece {
 /// once the corresponding king or rook moves, or once that rook is captured --
 /// there is no way to regain one. The whole struct is copied into `Undo` so
 /// unmake can restore the exact previous state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct CastlingRights {
     pub white_kingside: bool,
     pub white_queenside: bool,
@@ -120,6 +120,8 @@ pub struct Undo {
     pub castling_rook: Option<((usize, usize), (usize, usize))>,
     pub castling: CastlingRights,
     pub en_passant: Option<(usize, usize)>,
+    /// Halfmove clock before the move; restored verbatim by `unmake_move`.
+    pub halfmove_clock: u32,
     pub side_to_move: Color,
 }
 
@@ -299,12 +301,32 @@ fn is_en_passant_move(board: &Board, moving: Piece, mv: &Move) -> bool {
         && board.grid[mv.to.0][mv.to.1].is_none()
 }
 
+/// The part of a position that determines repetition identity.
+///
+/// Technically: two positions are the same for threefold repetition when the
+/// piece placement, side to move, castling rights, and legal en passant
+/// possibility all match. The halfmove clock is deliberately excluded -- FIDE
+/// 9.2.2 compares possible moves, not how long the position has existed.
+///
+/// This is a full structural key rather than a Zobrist hash. Hashing would be
+/// faster, but a collision here silently turns a win into a draw; at the current
+/// scale an exact 8x8 copy is the safer trade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PositionKey {
+    grid: [[Option<Piece>; 8]; 8],
+    side_to_move: Color,
+    castling: CastlingRights,
+    en_passant: Option<(usize, usize)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Board {
     pub grid: [[Option<Piece>; 8]; 8],
     pub side_to_move: Color,
     pub castling: CastlingRights,
     pub en_passant: Option<(usize, usize)>,
+    /// Halfmoves since the last pawn move or capture. 100 is a fifty-move draw.
+    pub halfmove_clock: u32,
 }
 
 impl Board {
@@ -319,6 +341,7 @@ impl Board {
             side_to_move: Color::White,
             castling: CastlingRights::NONE,
             en_passant: None,
+            halfmove_clock: 0,
         }
     }
 
@@ -352,6 +375,130 @@ impl Board {
 
         board.castling = CastlingRights::ALL;
         board
+    }
+
+    /// Returns the structural identity used for threefold repetition.
+    ///
+    /// Technically: copies the piece placement, side to move, castling rights,
+    /// and the en passant target *only if a legal en passant capture exists*.
+    /// The last condition is FIDE 9.2.2: two placements are different only when
+    /// a pawn could actually be captured en passant, so a stale target or a
+    /// target blocked by a pin must not split the repetition. The halfmove clock
+    /// is excluded because repetition is about the possible moves, not age.
+    pub fn position_key(&self) -> PositionKey {
+        PositionKey {
+            grid: self.grid,
+            side_to_move: self.side_to_move,
+            castling: self.castling,
+            en_passant: if self.has_legal_en_passant_capture() {
+                self.en_passant
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Returns `true` when the side to move has a legal en passant capture.
+    ///
+    /// Technically: the recorded target is the square the double-pushed pawn
+    /// skipped. The captured pawn and any capturing pawn stand on the same row:
+    /// `target.0 + 1` for White and `target.0 - 1` for Black. Each adjacent
+    /// candidate is played on a clone and checked with `in_check`, so a pinned
+    /// en passant pawn does not count. That distinction matters only for
+    /// repetition identity; move generation already filters legality later.
+    fn has_legal_en_passant_capture(&self) -> bool {
+        let Some(target) = self.en_passant else { return false };
+        if target.0 >= 8 || target.1 >= 8 { return false; }
+
+        let captured_row = match self.side_to_move {
+            Color::White => target.0 + 1,
+            Color::Black => match target.0.checked_sub(1) {
+                Some(row) => row,
+                None => return false,
+            },
+        };
+        if captured_row >= 8 { return false; }
+
+        // The captured pawn must still be there, and it must be the opponent's.
+        match self.grid[captured_row][target.1] {
+            Some(piece)
+                if piece.color == self.side_to_move.opponent()
+                    && piece.kind == PieceType::Pawn => {}
+            _ => return false,
+        }
+
+        for dc in [-1isize, 1] {
+            let from_col = target.1 as isize + dc;
+            if from_col < 0 || from_col >= 8 { continue; }
+            let from = (captured_row, from_col as usize);
+
+            match self.grid[from.0][from.1] {
+                Some(piece) if piece.color == self.side_to_move && piece.kind == PieceType::Pawn => {
+                    let mv = Move { from, to: target, promotion: None };
+                    let mut probe = self.clone();
+                    if probe.make_move(&mv).is_ok() && !in_check(&probe, self.side_to_move) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
+    /// Returns `true` for the standard insufficient-material draws.
+    ///
+    /// Technically: K vs K, K plus one minor piece vs K, and bishop-only
+    /// positions where every bishop stands on the same square-color complex are
+    /// dead -- no sequence of legal moves can produce checkmate. K+N vs K+N and
+    /// K+NN vs K are deliberately *not* included because mate is possible with
+    /// the defender's cooperation. The rule is conservative: it does not detect
+    /// blocked-pawn dead positions, so it can miss a draw but cannot invent one.
+    pub fn is_insufficient_material(&self) -> bool {
+        let mut knights = 0u32;
+        let mut bishops = 0u32;
+        let mut even_square_bishop = false;
+        let mut odd_square_bishop = false;
+
+        for r in 0..8 {
+            for c in 0..8 {
+                let Some(piece) = self.grid[r][c] else { continue };
+
+                match piece.kind {
+                    PieceType::Pawn | PieceType::Rook | PieceType::Queen => return false,
+                    PieceType::Knight => knights += 1,
+                    PieceType::Bishop => {
+                        bishops += 1;
+                        if (r + c) % 2 == 0 {
+                            even_square_bishop = true;
+                        } else {
+                            odd_square_bishop = true;
+                        }
+                    }
+                    PieceType::King => {}
+                }
+            }
+        }
+
+        if knights == 0 {
+            // No knight can cover the other color complex, so bishops restricted
+            // to one complex can never construct a mating net.
+            return !(even_square_bishop && odd_square_bishop);
+        }
+
+        // A single knight with no bishop is also insufficient; anything more
+        // can mate with cooperation and is therefore not a dead position.
+        knights == 1 && bishops == 0
+    }
+
+    /// Returns `true` once the halfmove clock reaches the fifty-move threshold.
+    ///
+    /// Technically: FIDE counts 100 halfmoves (50 moves by each player) since
+    /// the last pawn move or capture. `make_move` maintains the counter; this
+    /// method only interprets it.
+    pub fn is_fifty_move_draw(&self) -> bool {
+        self.halfmove_clock >= 100
     }
 
     /// Checks a bishop/rook/queen move against a fixed set of ray directions.
@@ -574,6 +721,7 @@ impl Board {
         let prev_side = self.side_to_move;
         let prev_castling = self.castling;
         let prev_en_passant = self.en_passant;
+        let prev_halfmove_clock = self.halfmove_clock;
 
         let moved = self.grid[mv.from.0][mv.from.1].expect("validated above");
 
@@ -632,6 +780,15 @@ impl Board {
             None
         };
 
+        // A pawn move or a capture is irreversible for fifty-move purposes and
+        // resets the clock. Everything else advances it; saturating_add keeps a
+        // hand-built absurd position from overflowing in debug builds.
+        self.halfmove_clock = if moved.kind == PieceType::Pawn || captured.is_some() {
+            0
+        } else {
+            prev_halfmove_clock.saturating_add(1)
+        };
+
         self.side_to_move = prev_side.opponent();
 
         Ok(Undo {
@@ -643,6 +800,7 @@ impl Board {
             castling_rook,
             castling: prev_castling,
             en_passant: prev_en_passant,
+            halfmove_clock: prev_halfmove_clock,
             side_to_move: prev_side,
         })
     }
@@ -666,6 +824,7 @@ impl Board {
 
         self.castling = undo.castling;
         self.en_passant = undo.en_passant;
+        self.halfmove_clock = undo.halfmove_clock;
         self.side_to_move = undo.side_to_move;
     }
 

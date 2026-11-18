@@ -7,7 +7,8 @@ Yuyutsu was the one Kaurava who chose to fight for the side he judged right.
 ## Status
 
 The rules layer is solid and verified. There is no search yet, so the engine does
-not play chess — it can only enumerate and apply legal moves.
+not play chess — it can only enumerate and apply legal moves, then report the
+resulting game state.
 
 **Working**
 
@@ -24,11 +25,17 @@ not play chess — it can only enumerate and apply legal moves.
 - Attack detection by scanning outward from a square (FIDE 3.1.3, so pinned
   pieces still count as attacking)
 - Checkmate and stalemate are distinguishable (empty legal list, plus check)
+- Halfmove clock maintained by `make_move` and restored exactly by `unmake_move`
+- Fifty-move rule at 100 halfmoves, threefold repetition, and the standard
+  insufficient-material set
+- `Game` / `GameState` reporting ongoing, checkmate, stalemate, or a typed
+  `DrawReason`, with checkmate and stalemate taking precedence
 
 **Not implemented**
 
-- Draw rules: fifty-move, threefold repetition, insufficient material
-- A `GameState` API; callers must interpret an empty legal list themselves
+- The full FIDE claim procedure: claimable draws are reported as terminal, and
+  automatic fivefold repetition / seventy-five-move draws are not distinguished
+- Complete dead-position analysis; blocked-pawn positions are not detected
 - Search, evaluation, MCTS
 - Bitboards
 - A user interface; `cargo run` is a smoke test that prints one move
@@ -37,8 +44,8 @@ not play chess — it can only enumerate and apply legal moves.
 
 ```sh
 cargo run                # print the legal move count, play one move, show the board
-cargo test               # 30 tests: rules, agreement, perft to depth 4, special moves
-cargo test --release     # 32 tests: adds start-position perft 5-6 and Kiwipete 4
+cargo test               # 41 tests: rules, agreement, perft to depth 4, special moves, draws
+cargo test --release     # 43 tests: adds start-position perft 5-6 and Kiwipete 4
 ```
 
 No dependencies. Rust 2024 edition.
@@ -47,7 +54,8 @@ No dependencies. Rust 2024 edition.
 
 | Path | Contents |
 | --- | --- |
-| `src/board.rs` | Board, pieces, castling rights, en passant target, `Undo`, `make_move`/`unmake_move`, validation, attack detection, legality filter |
+| `src/board.rs` | Board, pieces, castling rights, en passant target, halfmove clock, `Undo`, `make_move`/`unmake_move`, validation, attack detection, legality filter, repetition key, material draw check |
+| `src/game.rs` | `Game`, `GameState`, `DrawReason`, repetition history and terminal-state evaluation |
 | `src/moves.rs` | `Move` and the per-piece pseudo-legal generators, including castling and en passant |
 | `src/lib.rs` | Library root, so `tests/` can link the engine |
 | `src/main.rs` | Smoke-test binary |
@@ -55,6 +63,7 @@ No dependencies. Rust 2024 edition.
 | `tests/agreement.rs` | Generator/validator agreement and make/unmake round trips |
 | `tests/perft.rs` | Perft oracle for the start position and Kiwipete, plus targeted position tests |
 | `tests/special_moves.rs` | Castling and en passant edge cases in isolation |
+| `tests/draws.rs` | Halfmove clock, fifty-move, repetition identity, and insufficient material |
 
 ### Coordinates
 
@@ -65,7 +74,7 @@ internalising before reading the generators.
 
 ## Design
 
-Four decisions shape the codebase:
+Five decisions shape the codebase:
 
 **Move generation is pure.** Generators borrow the board and return moves; they
 never mutate. `make_move` is the only mutator, and it validates fully *before*
@@ -76,8 +85,8 @@ promotion }`. A king moving two files is a castle; a pawn moving diagonally onto
 an empty square is an en passant capture. Both tests are exact, so no extra field
 or parallel generator logic is needed. `Undo` is where the consequences are
 recorded: the captured square (different from `to` for en passant), the rook's
-source and destination (castling moves two pieces), and the previous castling
-rights and en passant target.
+source and destination (castling moves two pieces), the previous castling rights
+and en passant target, and the previous halfmove clock.
 
 **`Undo` carries what happened, not what was asked.** `Move` says "pawn to e8,
 promote to queen"; `Undo` records the piece that actually moved, what was
@@ -94,6 +103,15 @@ loop, because the king has already left the transit square by the time the board
 can be inspected: `castling_is_forbidden` rejects castling out of check or across
 an attacked square. Castling *into* check is caught by the ordinary
 make-and-ask loop.
+
+**Draw state is layered.** `Board` stays a pure position plus the halfmove clock,
+so perft and search can make and unmake without copying a history. Repetition is
+inherently historical, so `Game` owns a stack of `PositionKey`s alongside the
+board. The key is exact, not a Zobrist hash: grid, side to move, castling rights,
+and the en passant target *only when a legal capture exists*. Hashing would be
+faster, but a collision here would silently turn a win into a draw. `GameState`
+treats claimable draws as terminal and reports the reason; full FIDE claim
+handling belongs to a UI, not to search.
 
 ### Attack detection
 
@@ -144,14 +162,26 @@ validator. They are two independent implementations of the same rules, so they
 can drift; the suite asserts that every generated move is accepted, that accepted
 moves round-trip, and that rejected moves mutate nothing.
 
+`tests/draws.rs` pins the draw layer at both levels. On `Board`, it checks that
+the halfmove clock resets only on pawn moves and captures, advances otherwise, and
+is restored exactly by unmake; it also checks every insufficient-material
+boundary. On `Game`, it checks the fifty-move threshold at 99 versus 100, that
+checkmate and stalemate outrank a draw claim, and that threefold repetition needs
+a third occurrence and disappears again on unplay. The repetition-key tests
+include the FIDE detail that an en passant target distinguishes positions only
+when the capture is actually legal, including the pinned-pawn case.
+
 ## Roadmap
 
 Ordered by dependency rather than by visibility — each item is what the next one
 needs.
 
-1. Add a `GameState` enum: ongoing, checkmate, stalemate, draw
-2. Add draw rules: fifty-move, threefold repetition, insufficient material
-3. Switch the board to a bitboard representation
-4. Add a UCI or terminal input layer
-5. Build the MCTS search
+1. Switch the board to a bitboard representation
+2. Add a UCI or terminal input layer
+3. Build the MCTS search
+
+The remaining draw-rule refinements — FIDE claim semantics, automatic fivefold
+and seventy-five-move draws, and full dead-position detection — are deliberately
+deferred. They change how a result is reported to a human, not how search should
+treat a position it already knows is drawn.
 

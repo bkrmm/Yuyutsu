@@ -41,10 +41,12 @@ pub fn parse_square(text: &str) -> (usize, usize) {
 
 /// Builds a board from a FEN string.
 ///
-/// Technically: parses the four fields the engine currently models -- placement,
-/// side to move, castling rights and the en passant square. Halfmove clock and
-/// fullmove number are accepted and ignored because `Board` does not track them
-/// yet. Ranks are `/`-separated from rank 8 down, which matches row 0 upward.
+/// Technically: parses the five fields the engine models -- placement, side to
+/// move, castling rights, the en passant square, and the halfmove clock. The
+/// fullmove number is accepted and ignored because `Board` does not track it
+/// yet. A missing halfmove field defaults to zero, so the four-field FENs used
+/// by older tests keep working. Ranks are `/`-separated from rank 8 down, which
+/// matches row 0 upward.
 pub fn board_from_fen(fen: &str) -> Board {
     let mut fields = fen.split_whitespace();
 
@@ -52,6 +54,10 @@ pub fn board_from_fen(fen: &str) -> Board {
     let side = fields.next().expect("fen: side to move");
     let castling = fields.next().expect("fen: castling");
     let en_passant = fields.next().expect("fen: en passant");
+    let halfmove_clock = fields
+        .next()
+        .and_then(|field| field.parse::<u32>().ok())
+        .unwrap_or(0);
 
     let mut board = Board::empty();
 
@@ -102,6 +108,7 @@ pub fn board_from_fen(fen: &str) -> Board {
         "-" => None,
         sq => Some(parse_square(sq)),
     };
+    board.halfmove_clock = halfmove_clock;
 
     board
 }
