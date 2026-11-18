@@ -35,12 +35,12 @@ hot-seat board and rule checker, with both sides entered by hand.
 
 **Not implemented**
 
-- The full FIDE claim procedure: claimable draws are reported as terminal, and
+- [ ] The full FIDE claim procedure: claimable draws are reported as terminal, and
   automatic fivefold repetition / seventy-five-move draws are not distinguished
-- Complete dead-position analysis; blocked-pawn positions are not detected
-- Search, evaluation, MCTS
-- Bitboards
-- A UCI protocol for standard chess GUIs, and a graphical interface
+- [ ] Complete dead-position analysis; blocked-pawn positions are not detected
+- [ ] Search, evaluation, MCTS
+- [ ] Bitboards
+- [ ] A UCI protocol for standard chess GUIs, and a graphical interface
 
 ## Getting started
 
@@ -207,4 +207,3 @@ The remaining draw-rule refinements — FIDE claim semantics, automatic fivefold
 and seventy-five-move draws, and full dead-position detection — are deliberately
 deferred. They change how a result is reported to a human, not how search should
 treat a position it already knows is drawn.
-
