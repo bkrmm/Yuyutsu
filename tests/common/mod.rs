@@ -25,7 +25,7 @@ pub fn piece(color: Color, kind: PieceType) -> Piece {
 pub fn position(pieces: &[((usize, usize), Piece)], side_to_move: Color) -> Board {
     let mut board = Board::empty();
     for &(sq, p) in pieces {
-        board.grid[sq.0][sq.1] = Some(p);
+        board.set_piece((sq.0, sq.1), Some(p));
     }
     board.side_to_move = side_to_move;
     board
@@ -80,7 +80,7 @@ pub fn board_from_fen(fen: &str) -> Board {
                 other => panic!("unknown piece {other}"),
             };
 
-            board.grid[row][col] = Some(Piece { color, kind });
+            board.set_piece((row, col), Some(Piece { color, kind }));
             col += 1;
         }
         assert_eq!(col, 8, "rank {row} did not describe eight files");

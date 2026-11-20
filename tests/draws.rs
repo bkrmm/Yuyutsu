@@ -89,7 +89,7 @@ fn promotion_resets_the_halfmove_clock_and_unmake_restores_it() {
     let undo = board.make_move(&promotion).expect("e7e8=Q");
 
     assert_eq!(board.halfmove_clock, 0, "promotion must reset the clock");
-    assert_eq!(board.grid[0][4], Some(p(Color::White, PieceType::Queen)));
+    assert_eq!(board.piece_at((0, 4)), Some(p(Color::White, PieceType::Queen)));
 
     board.unmake_move(&undo);
     assert_eq!(board, before, "unmake did not restore the pawn or the clock");

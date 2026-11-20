@@ -12,8 +12,10 @@ hot-seat board and rule checker, with both sides entered by hand.
 
 **Working**
 
-- 8x8 board with piece placement and `side_to_move`
-- Pseudo-legal move generation for all six piece types
+- 64-bit bitboard board: twelve piece bitboards plus cached color and total
+  occupancy
+- Pseudo-legal move generation for all six piece types, driven by precomputed
+  attack tables and ray masks
 - Full geometric validation on every move, returning a typed `InvalidMove` reason
 - `make_move` / `unmake_move` as a matched pair driven by an `Undo` record
 - Promotion to queen, rook, bishop, or knight, on pushes *and* captures
@@ -22,8 +24,8 @@ hot-seat board and rule checker, with both sides entered by hand.
 - En passant, including the discovered-check case where the capture is
   geometrically valid but exposes the king
 - Legality filtering — moves leaving the mover's own king attacked are removed
-- Attack detection by scanning outward from a square (FIDE 3.1.3, so pinned
-  pieces still count as attacking)
+- Attack detection by bitboard intersection (FIDE 3.1.3, so pinned pieces still
+  count as attacking)
 - Checkmate and stalemate are distinguishable (empty legal list, plus check)
 - Halfmove clock maintained by `make_move` and restored exactly by `unmake_move`
 - Fifty-move rule at 100 halfmoves, threefold repetition, and the standard
@@ -39,15 +41,16 @@ hot-seat board and rule checker, with both sides entered by hand.
   automatic fivefold repetition / seventy-five-move draws are not distinguished
 - [ ] Complete dead-position analysis; blocked-pawn positions are not detected
 - [ ] Search, evaluation, MCTS
-- [ ] Bitboards
+- [ ] Sliding-piece attacks by magic bitboard; the current ray tables are exact
+  but do more work per query
 - [ ] A UCI protocol for standard chess GUIs, and a graphical interface
 
 ## Getting started
 
 ```sh
 cargo run                # start the terminal REPL
-cargo test               # 55 tests: rules, perft to depth 4, draws, terminal interface
-cargo test --release     # 57 tests: adds start-position perft 5-6 and Kiwipete 4
+cargo test               # 61 tests: rules, perft to depth 4, draws, representation, interface
+cargo test --release     # 63 tests: adds start-position perft 5-6 and Kiwipete 4
 ```
 
 No dependencies. Rust 2024 edition.
@@ -56,7 +59,7 @@ No dependencies. Rust 2024 edition.
 
 | Path | Contents |
 | --- | --- |
-| `src/board.rs` | Board, pieces, castling rights, en passant target, halfmove clock, `Undo`, `make_move`/`unmake_move`, validation, attack detection, legality filter, repetition key, material draw check |
+| `src/board.rs` | Bitboard board, pieces, castling rights, en passant target, halfmove clock, `Undo`, `make_move`/`unmake_move`, validation, attack tables, legality filter, repetition key, material draw check |
 | `src/game.rs` | `Game`, `GameState`, `DrawReason`, repetition history and terminal-state evaluation |
 | `src/moves.rs` | `Move` and the per-piece pseudo-legal generators, including castling and en passant |
 | `src/ui.rs` | Command parsing, `Session` with its undo stack, status labels, and help text |
@@ -66,6 +69,7 @@ No dependencies. Rust 2024 edition.
 | `tests/agreement.rs` | Generator/validator agreement and make/unmake round trips |
 | `tests/perft.rs` | Perft oracle for the start position and Kiwipete, plus targeted position tests |
 | `tests/special_moves.rs` | Castling and en passant edge cases in isolation |
+| `tests/bitboard.rs` | Square mapping, occupancy caching, attack-table geometry, ray blocking, and repetition-key structure |
 | `tests/draws.rs` | Halfmove clock, fifty-move, repetition identity, and insufficient material |
 | `tests/ui.rs` | Command parsing, session behavior, and terminal-state gating |
 
@@ -78,11 +82,25 @@ internalising before reading the generators.
 
 ## Design
 
-Six decisions shape the codebase:
+Seven decisions shape the codebase:
+
+**The board is a set of bitboards.** One `u64` per color and piece kind holds
+every square that piece stands on, with bit `row * 8 + column` (a8 is bit 0, h1
+is bit 63). Attacks are then set operations: a knight's targets are one table
+lookup, a rook's are four precomputed rays truncated at the nearest blocker.
+`occupied` and `occupied_by(color)` are cached words maintained by the same
+`put_piece`/`take_piece` helpers that move making uses, so no query rebuilds them
+from the twelve piece boards. The board is the only source of truth -- there is no
+parallel mailbox to drift out of sync. The measured gain is about 2× on perft,
+not an order of magnitude, because the legality filter still plays and reverts
+every candidate; attack detection is no longer the bottleneck.
 
 **Move generation is pure.** Generators borrow the board and return moves; they
 never mutate. `make_move` is the only mutator, and it validates fully *before*
-writing anything, so a rejected move provably leaves the board untouched.
+writing anything, so a rejected move provably leaves the board untouched. The
+legality filter calls an unchecked make internally, because the generator has
+already guaranteed every candidate's geometry; validation stays on the public
+entry point where external callers need it.
 
 **Special moves are derived, not stored.** `Move` is still only `{ from, to,
 promotion }`. A king moving two files is a castle; a pawn moving diagonally onto
@@ -111,12 +129,12 @@ make-and-ask loop.
 **Draw state is layered.** `Board` stays a pure position plus the halfmove clock,
 so perft and search can make and unmake without copying a history. Repetition is
 inherently historical, so `Game` owns a stack of `PositionKey`s alongside the
-board. The key is exact, not a Zobrist hash: grid, side to move, castling rights,
-and the en passant target *only when a legal capture exists*. Hashing would be
-faster, but a collision here would silently turn a win into a draw. `GameState`
-treats claimable draws as terminal and reports the reason; full FIDE claim
-handling belongs to a UI, not to search, and the current terminal simply locks
-the position once a claim becomes available.
+board. The key is exact, not a Zobrist hash: twelve bitboards, side to move,
+castling rights, and the en passant target *only when a legal capture exists*.
+Hashing would be smaller, but a collision here would silently turn a win into a
+draw. `GameState` treats claimable draws as terminal and reports the reason; full
+FIDE claim handling belongs to a UI, not to search, and the current terminal
+simply locks the position once a claim becomes available.
 
 **The interface is a separate layer.** `main.rs` owns stdin, stdout, and the
 prompt. `ui::Session` owns the `Game` plus the undo receipts, parses one line, and
@@ -132,8 +150,13 @@ permissive for search.
 
 ### Attack detection
 
-`is_attacked` scans outward from the target square instead of generating every
-enemy move, so it allocates nothing and stops at the first blocker on each ray.
+`is_attacked` answers "does this color attack this square?" without generating
+moves. It intersects the square's precomputed knight, king, and pawn attack sets
+with that color's piece bitboards, then asks whether the square's rook rays hit a
+rook or queen and whether its bishop rays hit a bishop or queen. A pawn's
+reverse lookup uses the *opposite* color's table, because the table maps
+"attacker square to attacked squares" and the query runs backwards.
+
 It implements the FIDE definition of "attacked" (3.1.3): a piece attacks a
 square even when it is pinned and could not legally move there. That is the
 correct definition for both check detection and the castling transit rule.
@@ -166,7 +189,10 @@ Kiwipete — the standard castling and en passant oracle:
 
 The deep cases are gated with `#[cfg(not(debug_assertions))]` rather than
 returning early in debug, so a debug run cannot be mistaken for coverage. A full
-release run takes roughly 17 seconds on the development machine.
+release run of the perft suite takes roughly 8 seconds on the development
+machine, down from about 17 before the bitboard rewrite. A/B runs of the same
+individual case show 12.25 s → 5.75 s for start-position depths 5–6 and
+0.95 s → 0.47 s for Kiwipete depth 4.
 
 `tests/special_moves.rs` isolates what perft can only count: both castles in
 Kiwipete, occupied paths (including b1 for queenside), castling out of, through,
@@ -194,14 +220,22 @@ unknown commands and malformed moves, rejection of a pinned move that geometry
 alone would accept, undo as a true stack, `new` clearing the old undo stack,
 checkmate and fifty-move lockout, and the human-readable status labels.
 
+`tests/bitboard.rs` covers the representation rather than the rules. Perft would
+notice a wrong attack table eventually, but it would report a node count, not the
+broken primitive. These tests pin the square-to-bit mapping as a bijection,
+occupancy-cache maintenance through add/replace/clear, open-board attack counts,
+ray truncation at a friendly blocker, the repetition key's exact fields, and
+make/unmake restoring both occupancy words.
+
 ## Roadmap
 
 Ordered by dependency rather than by visibility — each item is what the next one
 needs.
 
-1. Switch the board to a bitboard representation
-2. Build the MCTS search
-3. Add a UCI protocol for standard chess GUIs
+1. Build the MCTS search
+2. Add a UCI protocol for standard chess GUIs
+3. Replace the ray tables with magic bitboards if profiling shows slider attacks
+   dominating
 
 The remaining draw-rule refinements — FIDE claim semantics, automatic fivefold
 and seventy-five-move draws, and full dead-position detection — are deliberately

@@ -96,9 +96,9 @@ impl Game {
     /// Technically: `Board::generate_legal_moves` needs `&mut self` because it
     /// plays and reverts each candidate to test for self-check, while `Game`
     /// deliberately exposes the board immutably. Cloning the board for the
-    /// duration of the call keeps the game's history and clock untouched and
-    /// costs one 64-square copy — irrelevant outside a hot search loop, which
-    /// will call the board layer directly.
+    /// duration of the call keeps the game's history and clock untouched; the
+    /// board is a small fixed-size value now (twelve bitboards plus a few
+    /// fields), so the copy is cheap even in a search loop.
     pub fn legal_moves(&self) -> Vec<Move> {
         let mut probe = self.board.clone();
         probe.generate_legal_moves()

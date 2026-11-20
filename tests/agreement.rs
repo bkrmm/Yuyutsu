@@ -40,7 +40,7 @@ fn pawn_on(color: Color) -> Piece {
 
 fn pawn_on_board(from: (usize, usize), color: Color) -> Board {
     let mut b = Board::empty();
-    b.grid[from.0][from.1] = Some(pawn_on(color));
+    b.set_piece((from.0, from.1), Some(pawn_on(color)));
     b.side_to_move = color;
     b
 }
@@ -116,7 +116,7 @@ fn double_push_onto_occupied_landing_square_is_not_generated() {
     // real play, and the generator used to emit d7-d5 because the outer
     // occupancy check only cleared the intermediate square.
     let mut b = pawn_on_board((1, 3), Color::Black);
-    b.grid[3][3] = Some(Piece { color: Color::Black, kind: PieceType::Bishop });
+    b.set_piece((3, 3), Some(Piece { color: Color::Black, kind: PieceType::Bishop }));
 
     let generated = generate_all_moves(&b, Color::Black);
     assert!(
@@ -138,11 +138,11 @@ fn promotion_round_trips() {
 
             let mut b = pawn_on_board(from, color);
             let undo = b.make_move(&mv).expect("legal promotion rejected");
-            assert_eq!(b.grid[to.0][to.1], Some(Piece { color, kind }));
+            assert_eq!(b.piece_at((to.0, to.1)), Some(Piece { color, kind }));
 
             b.unmake_move(&undo);
-            assert_eq!(b.grid[from.0][from.1], Some(pawn_on(color)));
-            assert_eq!(b.grid[to.0][to.1], None);
+            assert_eq!(b.piece_at((from.0, from.1)), Some(pawn_on(color)));
+            assert_eq!(b.piece_at((to.0, to.1)), None);
             assert_eq!(b.side_to_move, color);
         }
     }
@@ -152,15 +152,15 @@ fn promotion_round_trips() {
 fn promotion_capture_round_trips() {
     let mut b = pawn_on_board((1, 4), Color::White);
     let captured = Piece { color: Color::Black, kind: PieceType::Rook };
-    b.grid[0][5] = Some(captured);
+    b.set_piece((0, 5), Some(captured));
 
     let mv = Move { from: (1, 4), to: (0, 5), promotion: Some(PieceType::Knight) };
     let undo = b.make_move(&mv).expect("legal promotion-capture rejected");
-    assert_eq!(b.grid[0][5], Some(Piece { color: Color::White, kind: PieceType::Knight }));
+    assert_eq!(b.piece_at((0, 5)), Some(Piece { color: Color::White, kind: PieceType::Knight }));
 
     b.unmake_move(&undo);
-    assert_eq!(b.grid[0][5], Some(captured));
-    assert_eq!(b.grid[1][4], Some(pawn_on(Color::White)));
+    assert_eq!(b.piece_at((0, 5)), Some(captured));
+    assert_eq!(b.piece_at((1, 4)), Some(pawn_on(Color::White)));
     assert_eq!(b.side_to_move, Color::White);
 }
 

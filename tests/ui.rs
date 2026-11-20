@@ -136,7 +136,7 @@ fn session_plays_legal_moves_and_rejects_illegal_ones() {
         Action::Played(mv((6, 4), (4, 4)))
     );
     assert_eq!(
-        session.game().board().grid[4][4],
+        session.game().board().piece_at((4, 4)),
         Some(p(Color::White, PieceType::Pawn))
     );
 
@@ -192,7 +192,7 @@ fn promotion_requires_a_suffix_and_accepts_one() {
     };
     assert_eq!(session.execute("a7a8q"), Action::Played(promotion));
     assert_eq!(
-        session.game().board().grid[0][0],
+        session.game().board().piece_at((0, 0)),
         Some(p(Color::White, PieceType::Queen))
     );
 }
@@ -355,11 +355,11 @@ fn coordinate_notation_reaches_castling_and_en_passant() {
         Action::Played(mv((7, 4), (7, 6)))
     );
     assert_eq!(
-        session.game().board().grid[7][6],
+        session.game().board().piece_at((7, 6)),
         Some(p(Color::White, PieceType::King))
     );
     assert_eq!(
-        session.game().board().grid[7][5],
+        session.game().board().piece_at((7, 5)),
         Some(p(Color::White, PieceType::Rook))
     );
 
@@ -375,11 +375,11 @@ fn coordinate_notation_reaches_castling_and_en_passant() {
         Action::Played(mv((3, 4), (2, 3)))
     );
     assert_eq!(
-        session.game().board().grid[2][3],
+        session.game().board().piece_at((2, 3)),
         Some(p(Color::White, PieceType::Pawn))
     );
     assert_eq!(
-        session.game().board().grid[3][3],
+        session.game().board().piece_at((3, 3)),
         None,
         "the captured pawn must leave d5"
     );

@@ -17,10 +17,52 @@ impl Color {
             Color::Black => Color::White,
         }
     }
+
+    /// Returns the zero-based index used to address per-color tables.
+    ///
+    /// Technically: the piece arrays are `[[u64; 6]; 2]`, so White is row 0 and
+    /// Black is row 1. Keeping the mapping in one function means a table cannot
+    /// silently swap sides.
+    pub fn index(self) -> usize {
+        match self {
+            Color::White => 0,
+            Color::Black => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum PieceType { Pawn, Knight, Bishop, Rook, Queen, King }
+
+impl PieceType {
+    /// Returns the zero-based index used to address per-kind tables.
+    ///
+    /// Technically: the order is pawn, knight, bishop, rook, queen, king, which
+    /// is also the order pawns are promoted through. It must match the layout of
+    /// `Board::pieces` and nothing else -- no persisted format depends on it.
+    pub fn index(self) -> usize {
+        match self {
+            PieceType::Pawn => 0,
+            PieceType::Knight => 1,
+            PieceType::Bishop => 2,
+            PieceType::Rook => 3,
+            PieceType::Queen => 4,
+            PieceType::King => 5,
+        }
+    }
+
+    /// Returns every kind a pawn may promote into.
+    ///
+    /// Technically: the order is the one the generator emits, so a promotion
+    /// move list is stable. The king and pawn are excluded because the rules
+    /// forbid them, not because the board cannot represent them.
+    pub const PROMOTIONS: [PieceType; 4] = [
+        PieceType::Queen,
+        PieceType::Rook,
+        PieceType::Bishop,
+        PieceType::Knight,
+    ];
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Piece {
@@ -106,13 +148,16 @@ pub enum InvalidMove {
 /// Technically: this is "what happened", not "what was asked". `Move` is the
 /// request; `Undo` is the receipt. It therefore has to record facts that the
 /// request cannot express -- which square the captured piece actually stood on
-/// (en passant captures land on a different square than the piece occupied) and
+/// (en passant captures land on a different square than the piece occupied),
+/// which piece ended up on `to` (a promotion changes the kind in flight), and
 /// where the rook started and ended (castling moves two pieces).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Undo {
     pub from: (usize, usize),
     pub to: (usize, usize),
     pub moved: Piece,
+    /// The piece that now stands on `to`; differs from `moved` on a promotion.
+    pub placed: Piece,
     pub captured: Option<Piece>,
     /// Square the captured piece came from; equals `to` except for en passant.
     pub captured_square: (usize, usize),
@@ -135,149 +180,327 @@ fn in_bounds(sq: (usize, usize)) -> bool {
     sq.0 < 8 && sq.1 < 8
 }
 
-/// Returns `true` when `to` is exactly one fixed step away from `from`.
+/// Converts `(row, column)` into a bit index in `0..64`.
 ///
-/// Technically: the arithmetic happens in `isize` so a negative result cannot
-/// wrap, and the destination is compared as a tuple. Used for knight and king
-/// moves, which have no path to clear -- only bounds and a single offset apply.
-fn offset_ok(from: (usize, usize), to: (usize, usize), steps: &[(isize, isize)]) -> bool {
-    steps.iter().any(|&(dr, dc)| {
-        let r = from.0 as isize + dr;
-        let c = from.1 as isize + dc;
-        r >= 0 && r < 8 && c >= 0 && c < 8 && (r as usize, c as usize) == to
-    })
+/// Technically: the mapping is `row * 8 + column`, so bit 0 is a8 and bit 63 is
+/// h1. Ascending bit order is therefore the same row-major order the old
+/// mailbox scan used, which keeps generated move lists familiar.
+pub fn square_index((row, column): (usize, usize)) -> usize {
+    row * 8 + column
 }
 
-/// Finds `color`'s king, if it is on the board.
+/// Converts a bit index in `0..64` back into `(row, column)`.
 ///
-/// Technically: a linear scan of 64 squares. Doing this once per query is fine
-/// at the current scale; an engine that caches king squares per color would
-/// replace this with two indexed lookups.
-fn find_king(board: &Board, color: Color) -> Option<(usize, usize)> {
-    for r in 0..8 {
-        for c in 0..8 {
-            if let Some(piece) = board.grid[r][c]
-                && piece.color == color
-                && piece.kind == PieceType::King
-            {
-                return Some((r, c));
+/// Technically: the exact inverse of `square_index`. Callers that already hold a
+/// `Move` use tuple coordinates; this is for bit scans, which yield indices.
+pub fn square_of(index: usize) -> (usize, usize) {
+    (index / 8, index % 8)
+}
+
+/// Returns the single-bit mask for a square.
+///
+/// Technically: `1 << index` as a `u64`. Every bitboard operation is built from
+/// these masks plus `&`, `|`, and `!`; there is no arithmetic on squares.
+pub fn square_bit(square: (usize, usize)) -> u64 {
+    1u64 << square_index(square)
+}
+
+const KNIGHT_STEPS: [(isize, isize); 8] = [
+    (2, 1), (2, -1), (-2, 1), (-2, -1),
+    (1, 2), (1, -2), (-1, 2), (-1, -2),
+];
+
+const KING_STEPS: [(isize, isize); 8] = [
+    (0, 1), (0, -1), (1, 0), (-1, 0),
+    (1, 1), (1, -1), (-1, 1), (-1, -1),
+];
+
+/// Builds a per-square attack table for a fixed-step piece.
+///
+/// Technically: evaluates at compile time, so the binary carries 64 `u64`s per
+/// piece and pays nothing at startup. Offsets are applied in `isize` so a jump
+/// off the board is rejected before it can wrap; the bit index is computed only
+/// after the bounds check.
+const fn build_step_table(steps: &[(isize, isize); 8]) -> [u64; 64] {
+    let mut table = [0u64; 64];
+    let mut square = 0usize;
+    while square < 64 {
+        let row = (square / 8) as isize;
+        let column = (square % 8) as isize;
+        let mut step = 0usize;
+        while step < 8 {
+            let r = row + steps[step].0;
+            let c = column + steps[step].1;
+            if r >= 0 && r < 8 && c >= 0 && c < 8 {
+                table[square] |= 1u64 << ((r as usize) * 8 + (c as usize));
+            }
+            step += 1;
+        }
+        square += 1;
+    }
+    table
+}
+
+/// Builds a per-square attack table for a pawn of one color.
+///
+/// Technically: White attacks toward decreasing rows because row 0 is rank 8.
+/// The table is indexed `[color][square]` and answers "which squares does a pawn
+/// of this color standing here attack?", not "which pawns attack here?". The
+/// reverse lookup is the same table for the opposite color, which is why
+/// `is_attacked` swaps the color.
+const fn build_pawn_table(color: usize) -> [u64; 64] {
+    let forward: isize = if color == 0 { -1 } else { 1 };
+    let mut table = [0u64; 64];
+    let mut square = 0usize;
+    while square < 64 {
+        let row = (square / 8) as isize;
+        let column = (square % 8) as isize;
+        let r = row + forward;
+        if r >= 0 && r < 8 {
+            if column > 0 {
+                table[square] |= 1u64 << ((r as usize) * 8 + (column as usize - 1));
+            }
+            if column < 7 {
+                table[square] |= 1u64 << ((r as usize) * 8 + (column as usize + 1));
             }
         }
+        square += 1;
     }
-    None
+    table
+}
+
+/// The eight slider directions, in the order the ray tables store them.
+///
+/// Technically: indices 0..4 are orthogonal (north, south, east, west) and
+/// 4..8 are diagonal (northeast, northwest, southeast, southwest). Splitting the
+/// ranges is what lets `rook_attacks` and `bishop_attacks` share one ray builder.
+const DIRECTIONS: [(isize, isize); 8] = [
+    (-1, 0), (1, 0), (0, 1), (0, -1),
+    (-1, 1), (-1, -1), (1, 1), (1, -1),
+];
+
+/// Whether each direction moves toward higher bit indices.
+///
+/// Technically: north is `-8`, south is `+8`, east is `+1`, west is `-1`;
+/// diagonals combine those deltas. A ray's nearest blocker is the *lowest* set
+/// bit when the direction ascends and the *highest* when it descends, so this
+/// table selects between `trailing_zeros` and `leading_zeros`.
+const DIRECTION_ASCENDS: [bool; 8] = [
+    false, true, true, false,
+    false, false, true, true,
+];
+
+/// Builds the ray table: every square strictly beyond `square` in each direction.
+///
+/// Technically: rays exclude the origin and include the board edge. Attack
+/// generation later intersects a ray with occupancy and keeps everything up to
+/// the first blocker, which is why storing the full ray is useful even though it
+/// usually gets truncated.
+const fn build_rays() -> [[u64; 64]; 8] {
+    let mut rays = [[0u64; 64]; 8];
+    let mut direction = 0usize;
+    while direction < 8 {
+        let (dr, dc) = DIRECTIONS[direction];
+        let mut square = 0usize;
+        while square < 64 {
+            let mut row = (square / 8) as isize + dr;
+            let mut column = (square % 8) as isize + dc;
+            while row >= 0 && row < 8 && column >= 0 && column < 8 {
+                rays[direction][square] |= 1u64 << ((row as usize) * 8 + column as usize);
+                row += dr;
+                column += dc;
+            }
+            square += 1;
+        }
+        direction += 1;
+    }
+    rays
+}
+
+/// Builds the "all bits strictly below this one" masks.
+///
+/// Technically: `BELOW[s]` is `(1 << s) - 1`. Truncating a descending ray at its
+/// nearest blocker is then a single `& !BELOW[blocker]`, which keeps the blocker
+/// itself so the capture square survives.
+const fn build_below() -> [u64; 64] {
+    let mut table = [0u64; 64];
+    let mut square = 0usize;
+    while square < 64 {
+        table[square] = (1u64 << square) - 1;
+        square += 1;
+    }
+    table
+}
+
+/// Builds the "all bits strictly above this one" masks.
+///
+/// Technically: `ABOVE[s]` is `u64::MAX << (s + 1)`, with the `s == 63` case
+/// special-cased to zero because shifting by 64 is undefined. Ascending rays are
+/// truncated with `& !ABOVE[blocker]` for the same reason as `BELOW`.
+const fn build_above() -> [u64; 64] {
+    let mut table = [0u64; 64];
+    let mut square = 0usize;
+    while square < 64 {
+        table[square] = if square == 63 { 0 } else { u64::MAX << (square + 1) };
+        square += 1;
+    }
+    table
+}
+
+/// Builds the mask of squares whose `(row + column)` is even.
+///
+/// Technically: used only by insufficient-material detection, where the question
+/// is whether every bishop stands on one color complex. Which complex is "even"
+/// does not matter, only that the two sets partition the board.
+const fn build_even_squares() -> u64 {
+    let mut mask = 0u64;
+    let mut square = 0usize;
+    while square < 64 {
+        if (square / 8 + square % 8) % 2 == 0 {
+            mask |= 1u64 << square;
+        }
+        square += 1;
+    }
+    mask
+}
+
+static KNIGHT_ATTACKS: [u64; 64] = build_step_table(&KNIGHT_STEPS);
+static KING_ATTACKS: [u64; 64] = build_step_table(&KING_STEPS);
+static PAWN_ATTACKS: [[u64; 64]; 2] = [build_pawn_table(0), build_pawn_table(1)];
+static RAYS: [[u64; 64]; 8] = build_rays();
+static BELOW: [u64; 64] = build_below();
+static ABOVE: [u64; 64] = build_above();
+static EVEN_SQUARES: u64 = build_even_squares();
+
+/// Returns the squares a knight on `square` attacks.
+///
+/// Technically: one table lookup. Knights jump, so occupancy is irrelevant and
+/// there is no path to block.
+pub fn knight_attacks(square: (usize, usize)) -> u64 {
+    KNIGHT_ATTACKS[square_index(square)]
+}
+
+/// Returns the squares a king on `square` attacks.
+///
+/// Technically: one table lookup over the eight adjacent squares. The same table
+/// makes "kings may not touch" fall out of check detection.
+pub fn king_attacks(square: (usize, usize)) -> u64 {
+    KING_ATTACKS[square_index(square)]
+}
+
+/// Returns the squares a pawn of `color` on `square` attacks.
+///
+/// Technically: pawn captures are the only attacks that depend on color. A
+/// straight push is not an attack, so it is not in this table.
+pub fn pawn_attacks(color: Color, square: (usize, usize)) -> u64 {
+    PAWN_ATTACKS[color.index()][square_index(square)]
+}
+
+/// Returns the squares reachable from `square` along one ray before a blocker.
+///
+/// Technically: intersects the precomputed ray with occupancy, then keeps the
+/// segment from the origin through the *nearest* blocker. The nearest blocker is
+/// the lowest set bit on an ascending ray and the highest on a descending one,
+/// because bits are laid out row-major. The blocker itself is included so a
+/// capture of an enemy piece survives; the caller masks off friendly pieces.
+fn ray_attacks(square: usize, occupied: u64, direction: usize) -> u64 {
+    let ray = RAYS[direction][square];
+    let blockers = ray & occupied;
+    if blockers == 0 {
+        return ray;
+    }
+
+    if DIRECTION_ASCENDS[direction] {
+        let blocker = blockers.trailing_zeros() as usize;
+        ray & !ABOVE[blocker]
+    } else {
+        let blocker = 63 - blockers.leading_zeros() as usize;
+        ray & !BELOW[blocker]
+    }
+}
+
+/// Returns the squares a rook on `square` attacks given the full occupancy.
+///
+/// Technically: four orthogonal ray computations, one per direction, OR-ed
+/// together. Occupancy is passed in rather than read from a board so the same
+/// function serves attack detection, move generation, and child-board probes.
+pub fn rook_attacks(square: (usize, usize), occupied: u64) -> u64 {
+    let index = square_index(square);
+    ray_attacks(index, occupied, 0)
+        | ray_attacks(index, occupied, 1)
+        | ray_attacks(index, occupied, 2)
+        | ray_attacks(index, occupied, 3)
+}
+
+/// Returns the squares a bishop on `square` attacks given the full occupancy.
+///
+/// Technically: the diagonal half of the ray table. A bishop is exactly these
+/// four rays, which is why queens reuse both this and `rook_attacks`.
+pub fn bishop_attacks(square: (usize, usize), occupied: u64) -> u64 {
+    let index = square_index(square);
+    ray_attacks(index, occupied, 4)
+        | ray_attacks(index, occupied, 5)
+        | ray_attacks(index, occupied, 6)
+        | ray_attacks(index, occupied, 7)
+}
+
+/// Returns the squares a queen on `square` attacks given the full occupancy.
+///
+/// Technically: rook plus bishop. The union is exact because the two ray sets
+/// are disjoint and together cover all eight directions.
+pub fn queen_attacks(square: (usize, usize), occupied: u64) -> u64 {
+    rook_attacks(square, occupied) | bishop_attacks(square, occupied)
 }
 
 /// Returns `true` if `color` has a piece attacking `square`.
 ///
-/// Technically: scans *outward from the target* rather than generating moves,
-/// so it allocates nothing. Pawns, knights and kings are checked as fixed
-/// offsets; sliders walk each ray and stop at the first piece, because only the
-/// nearest piece on a ray can attack.
+/// Technically: the bitboard mirror of the old outward scan, inverted. Instead
+/// of probing neighbours one at a time, it asks "does the set of squares this
+/// piece type attacks overlap the enemy pieces?". Pawn, knight, and king tests
+/// are single table ANDs; sliders are four ray computations each.
 ///
 /// This deliberately implements the FIDE definition of "attacked" (3.1.3): a
 /// piece attacks a square even if it is pinned and could not legally move
 /// there. That makes it correct both for check detection and for the castling
 /// rule, which forbids crossing an attacked square.
 pub fn is_attacked(board: &Board, square: (usize, usize), by: Color) -> bool {
-    let r = square.0 as isize;
-    let c = square.1 as isize;
-
-    // Pawns. White attacks one row above itself (row - 1), so a White attacker
-    // sits one row *below* the target. Black is the mirror image.
-    let pawn_row = if by == Color::White { r + 1 } else { r - 1 };
-    for dc in [-1isize, 1] {
-        let pc = c + dc;
-        if pawn_row >= 0 && pawn_row < 8 && pc >= 0 && pc < 8
-            && let Some(piece) = board.grid[pawn_row as usize][pc as usize]
-            && piece.color == by
-            && piece.kind == PieceType::Pawn
-        {
-            return true;
-        }
+    if knight_attacks(square) & board.pieces_of(by, PieceType::Knight) != 0 {
+        return true;
+    }
+    if king_attacks(square) & board.pieces_of(by, PieceType::King) != 0 {
+        return true;
+    }
+    // A pawn of `by` attacks `square` exactly when `square` is one of the
+    // squares a pawn of the *opposite* color would attack from there. The
+    // mirror is why this swaps the color instead of using the table directly.
+    if pawn_attacks(by.opponent(), square) & board.pieces_of(by, PieceType::Pawn) != 0 {
+        return true;
     }
 
-    // Knights: fixed jumps, nothing can block them.
-    const KNIGHT: [(isize, isize); 8] = [
-        (2, 1), (2, -1), (-2, 1), (-2, -1),
-        (1, 2), (1, -2), (-1, 2), (-1, -2),
-    ];
-    for (dr, dc) in KNIGHT {
-        let nr = r + dr;
-        let nc = c + dc;
-        if nr >= 0 && nr < 8 && nc >= 0 && nc < 8
-            && let Some(piece) = board.grid[nr as usize][nc as usize]
-            && piece.color == by
-            && piece.kind == PieceType::Knight
-        {
-            return true;
-        }
+    let occupied = board.occupied();
+    let rooks_and_queens =
+        board.pieces_of(by, PieceType::Rook) | board.pieces_of(by, PieceType::Queen);
+    if rook_attacks(square, occupied) & rooks_and_queens != 0 {
+        return true;
     }
 
-    // Kings: adjacent squares. This also makes "kings may not touch" fall out
-    // of check detection instead of needing a separate rule.
-    const KING: [(isize, isize); 8] = [
-        (0, 1), (0, -1), (1, 0), (-1, 0),
-        (1, 1), (1, -1), (-1, 1), (-1, -1),
-    ];
-    for (dr, dc) in KING {
-        let nr = r + dr;
-        let nc = c + dc;
-        if nr >= 0 && nr < 8 && nc >= 0 && nc < 8
-            && let Some(piece) = board.grid[nr as usize][nc as usize]
-            && piece.color == by
-            && piece.kind == PieceType::King
-        {
-            return true;
-        }
-    }
-
-    // Sliding pieces. Walk each ray from the target outward and stop at the
-    // first occupied square: a piece behind a blocker cannot attack the target.
-    const ORTHO: [(isize, isize); 4] = [(0, 1), (0, -1), (1, 0), (-1, 0)];
-    for (dr, dc) in ORTHO {
-        let mut nr = r + dr;
-        let mut nc = c + dc;
-        while nr >= 0 && nr < 8 && nc >= 0 && nc < 8 {
-            if let Some(piece) = board.grid[nr as usize][nc as usize] {
-                if piece.color == by && matches!(piece.kind, PieceType::Rook | PieceType::Queen) {
-                    return true;
-                }
-                break;
-            }
-            nr += dr;
-            nc += dc;
-        }
-    }
-
-    const DIAG: [(isize, isize); 4] = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-    for (dr, dc) in DIAG {
-        let mut nr = r + dr;
-        let mut nc = c + dc;
-        while nr >= 0 && nr < 8 && nc >= 0 && nc < 8 {
-            if let Some(piece) = board.grid[nr as usize][nc as usize] {
-                if piece.color == by && matches!(piece.kind, PieceType::Bishop | PieceType::Queen) {
-                    return true;
-                }
-                break;
-            }
-            nr += dr;
-            nc += dc;
-        }
-    }
-
-    false
+    let bishops_and_queens =
+        board.pieces_of(by, PieceType::Bishop) | board.pieces_of(by, PieceType::Queen);
+    bishop_attacks(square, occupied) & bishops_and_queens != 0
 }
 
 /// Returns `true` if `color`'s king stands on an attacked square.
 ///
-/// Technically: locates the king and delegates to `is_attacked`. A missing king
-/// reports "not in check" rather than panicking, which keeps hand-built test
-/// positions without a king usable.
+/// Technically: finds the king with a single trailing-zero scan of its bitboard
+/// and delegates to `is_attacked`. A missing king reports "not in check" rather
+/// than panicking, which keeps hand-built test positions without a king usable.
 pub fn in_check(board: &Board, color: Color) -> bool {
-    match find_king(board, color) {
-        Some(king) => is_attacked(board, king, color.opponent()),
-        None => false,
+    let king = board.pieces_of(color, PieceType::King);
+    if king == 0 {
+        return false;
     }
+    let square = square_of(king.trailing_zeros() as usize);
+    is_attacked(board, square, color.opponent())
 }
 
 /// Returns `true` if this move is a castle: a king advancing two files.
@@ -298,7 +521,7 @@ fn is_castling_move(moving: Piece, mv: &Move) -> bool {
 fn is_en_passant_move(board: &Board, moving: Piece, mv: &Move) -> bool {
     moving.kind == PieceType::Pawn
         && mv.to.1 != mv.from.1
-        && board.grid[mv.to.0][mv.to.1].is_none()
+        && board.piece_at(mv.to).is_none()
 }
 
 /// The part of a position that determines repetition identity.
@@ -308,12 +531,13 @@ fn is_en_passant_move(board: &Board, moving: Piece, mv: &Move) -> bool {
 /// possibility all match. The halfmove clock is deliberately excluded -- FIDE
 /// 9.2.2 compares possible moves, not how long the position has existed.
 ///
-/// This is a full structural key rather than a Zobrist hash. Hashing would be
-/// faster, but a collision here silently turns a win into a draw; at the current
-/// scale an exact 8x8 copy is the safer trade.
+/// This is a full structural key rather than a Zobrist hash: twelve bitboards
+/// plus the position flags, compared exactly. Hashing would be smaller and
+/// faster, but a collision here silently turns a win into a draw; the bitboard
+/// copy is already cheap enough that the safer trade costs almost nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PositionKey {
-    grid: [[Option<Piece>; 8]; 8],
+    pieces: [[u64; 6]; 2],
     side_to_move: Color,
     castling: CastlingRights,
     en_passant: Option<(usize, usize)>,
@@ -321,7 +545,14 @@ pub struct PositionKey {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Board {
-    pub grid: [[Option<Piece>; 8]; 8],
+    /// One bitboard per color and piece kind: `pieces[color.index()][kind.index()]`.
+    pieces: [[u64; 6]; 2],
+    /// Occupancy per color, cached so attack and generation code does not rebuild
+    /// it from six bitboards on every query. Kept in lockstep by `put_piece`,
+    /// `take_piece`, and `set_piece`, which are the only mutators.
+    occupied_by_color: [u64; 2],
+    /// Both colors' occupancy together; slider rays read this single word.
+    occupied: u64,
     pub side_to_move: Color,
     pub castling: CastlingRights,
     pub en_passant: Option<(usize, usize)>,
@@ -329,15 +560,28 @@ pub struct Board {
     pub halfmove_clock: u32,
 }
 
+impl Default for Board {
+    /// Creates the standard starting position.
+    ///
+    /// Technically: delegates to `new` so there is one definition of "the
+    /// starting position". `Default` is what collection and test helpers reach
+    /// for when they want a usable board rather than an empty one.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Board {
     /// Creates a board with no pieces, no castling rights and White to move.
     ///
     /// Technically: the canonical zero value for hand-built test and puzzle
-    /// positions. `new()` is built on top of this so only one place constructs
-    /// the empty grid.
+    /// positions. Every bitboard starts empty, which is why this is the one
+    /// constructor that does not need to reason about square layout.
     pub fn empty() -> Self {
         Board {
-            grid: [[None; 8]; 8],
+            pieces: [[0u64; 6]; 2],
+            occupied_by_color: [0u64; 2],
+            occupied: 0,
             side_to_move: Color::White,
             castling: CastlingRights::NONE,
             en_passant: None,
@@ -361,33 +605,141 @@ impl Board {
 
         let mut board = Board::empty();
         for (file, kind) in back_rank.iter().enumerate() {
-            board.grid[0][file] = Some(Piece { color: Color::Black, kind: *kind });
+            board.set_piece((0, file), Some(Piece { color: Color::Black, kind: *kind }));
+            board.set_piece((7, file), Some(Piece { color: Color::White, kind: *kind }));
         }
         for file in 0..8 {
-            board.grid[1][file] = Some(Piece { color: Color::Black, kind: PieceType::Pawn });
-        }
-        for file in 0..8 {
-            board.grid[6][file] = Some(Piece { color: Color::White, kind: PieceType::Pawn });
-        }
-        for (file, kind) in back_rank.iter().enumerate() {
-            board.grid[7][file] = Some(Piece { color: Color::White, kind: *kind });
+            board.set_piece((1, file), Some(Piece { color: Color::Black, kind: PieceType::Pawn }));
+            board.set_piece((6, file), Some(Piece { color: Color::White, kind: PieceType::Pawn }));
         }
 
         board.castling = CastlingRights::ALL;
         board
     }
 
+    /// Returns the piece standing on a square, if any.
+    ///
+    /// Technically: checks the total occupancy first, so an empty square costs
+    /// one test. A set square can only belong to one color, which halves the
+    /// twelve-way scan to a six-way kind search. Out-of-bounds coordinates
+    /// report `None` rather than panicking, so a bad hand-built fixture cannot
+    /// crash a formatter or a probe.
+    pub fn piece_at(&self, square: (usize, usize)) -> Option<Piece> {
+        if !in_bounds(square) {
+            return None;
+        }
+
+        let mask = square_bit(square);
+        if self.occupied & mask == 0 {
+            return None;
+        }
+
+        // Only one color can own the square, so this halves the twelve-way scan
+        // to a six-way one before the kind search.
+        let color = if self.occupied_by_color[Color::White.index()] & mask != 0 {
+            Color::White
+        } else {
+            Color::Black
+        };
+
+        for kind in [
+            PieceType::Pawn,
+            PieceType::Knight,
+            PieceType::Bishop,
+            PieceType::Rook,
+            PieceType::Queen,
+            PieceType::King,
+        ] {
+            if self.pieces[color.index()][kind.index()] & mask != 0 {
+                return Some(Piece { color, kind });
+            }
+        }
+        None
+    }
+
+    /// Places a piece on a square, replacing whatever was there.
+    ///
+    /// Technically: removes the existing piece through the same typed helpers
+    /// move making uses, then adds the new one. Going through `take_piece` is
+    /// what keeps the cached occupancy in lockstep with the piece bitboards; a
+    /// direct bitboard write here would desynchronise them.
+    pub fn set_piece(&mut self, square: (usize, usize), piece: Option<Piece>) {
+        if !in_bounds(square) {
+            return;
+        }
+
+        if let Some(existing) = self.piece_at(square) {
+            self.take_piece(square, existing);
+        }
+        if let Some(piece) = piece {
+            self.put_piece(square, piece);
+        }
+    }
+
+    /// Returns the bitboard of every piece of one kind and color.
+    ///
+    /// Technically: a direct array read. This is the raw material for move
+    /// generation and evaluation; callers that want "all pieces of a color" use
+    /// `occupied_by` instead.
+    pub fn pieces_of(&self, color: Color, kind: PieceType) -> u64 {
+        self.pieces[color.index()][kind.index()]
+    }
+
+    /// Returns the bitboard of every piece belonging to `color`.
+    ///
+    /// Technically: a cached field read. `put_piece`, `take_piece`, and
+    /// `set_piece` maintain it alongside the piece bitboards, so move generation
+    /// does not pay six ORs every time it needs a friendly-destination mask.
+    pub fn occupied_by(&self, color: Color) -> u64 {
+        self.occupied_by_color[color.index()]
+    }
+
+    /// Returns the bitboard of every piece on the board.
+    ///
+    /// Technically: a cached field read. Slider attacks need this single word,
+    /// and it is the most frequently read value in the whole search.
+    pub fn occupied(&self) -> u64 {
+        self.occupied
+    }
+
+    /// Sets one bitboard bit and updates both occupancy caches.
+    ///
+    /// Technically: the fast path used by `make_move`, where the caller has
+    /// already established that `square` is empty and knows the exact piece. It
+    /// does not clear the square, so it must be paired with `take_piece` on the
+    /// origin.
+    fn put_piece(&mut self, square: (usize, usize), piece: Piece) {
+        let mask = square_bit(square);
+        self.pieces[piece.color.index()][piece.kind.index()] |= mask;
+        self.occupied_by_color[piece.color.index()] |= mask;
+        self.occupied |= mask;
+    }
+
+    /// Clears one bitboard bit and updates both occupancy caches.
+    ///
+    /// Technically: the inverse of `put_piece`, and equally trusting. Unmake
+    /// depends on `Undo` naming the exact piece that was on the square, which is
+    /// why the receipt records both `moved` and `placed`. Clearing occupancy
+    /// unconditionally is safe because a square holds at most one piece: if this
+    /// piece was there, no other piece of either color can be.
+    fn take_piece(&mut self, square: (usize, usize), piece: Piece) {
+        let mask = square_bit(square);
+        self.pieces[piece.color.index()][piece.kind.index()] &= !mask;
+        self.occupied_by_color[piece.color.index()] &= !mask;
+        self.occupied &= !mask;
+    }
+
     /// Returns the structural identity used for threefold repetition.
     ///
-    /// Technically: copies the piece placement, side to move, castling rights,
-    /// and the en passant target *only if a legal en passant capture exists*.
-    /// The last condition is FIDE 9.2.2: two placements are different only when
-    /// a pawn could actually be captured en passant, so a stale target or a
-    /// target blocked by a pin must not split the repetition. The halfmove clock
-    /// is excluded because repetition is about the possible moves, not age.
+    /// Technically: copies the twelve piece bitboards, side to move, castling
+    /// rights, and the en passant target *only if a legal en passant capture
+    /// exists*. The last condition is FIDE 9.2.2: two placements are different
+    /// only when a pawn could actually be captured en passant, so a stale target
+    /// or a target blocked by a pin must not split the repetition. The halfmove
+    /// clock is excluded because repetition is about the possible moves, not age.
     pub fn position_key(&self) -> PositionKey {
         PositionKey {
-            grid: self.grid,
+            pieces: self.pieces,
             side_to_move: self.side_to_move,
             castling: self.castling,
             en_passant: if self.has_legal_en_passant_capture() {
@@ -402,13 +754,17 @@ impl Board {
     ///
     /// Technically: the recorded target is the square the double-pushed pawn
     /// skipped. The captured pawn and any capturing pawn stand on the same row:
-    /// `target.0 + 1` for White and `target.0 - 1` for Black. Each adjacent
-    /// candidate is played on a clone and checked with `in_check`, so a pinned
-    /// en passant pawn does not count. That distinction matters only for
-    /// repetition identity; move generation already filters legality later.
+    /// `target.0 + 1` for White and `target.0 - 1` for Black. Candidate attackers
+    /// are found by intersecting the target square's reverse pawn attack set
+    /// with the mover's pawns, then each is played on a copy and checked with
+    /// `in_check`, so a pinned en passant pawn does not count. That distinction
+    /// matters only for repetition identity; move generation already filters
+    /// legality later.
     fn has_legal_en_passant_capture(&self) -> bool {
         let Some(target) = self.en_passant else { return false };
-        if target.0 >= 8 || target.1 >= 8 { return false; }
+        if !in_bounds(target) {
+            return false;
+        }
 
         let captured_row = match self.side_to_move {
             Color::White => target.0 + 1,
@@ -417,30 +773,33 @@ impl Board {
                 None => return false,
             },
         };
-        if captured_row >= 8 { return false; }
+        if captured_row >= 8 {
+            return false;
+        }
 
         // The captured pawn must still be there, and it must be the opponent's.
-        match self.grid[captured_row][target.1] {
+        match self.piece_at((captured_row, target.1)) {
             Some(piece)
                 if piece.color == self.side_to_move.opponent()
                     && piece.kind == PieceType::Pawn => {}
             _ => return false,
         }
 
-        for dc in [-1isize, 1] {
-            let from_col = target.1 as isize + dc;
-            if from_col < 0 || from_col >= 8 { continue; }
-            let from = (captured_row, from_col as usize);
+        // A mover pawn attacks the target exactly when the target's reverse
+        // pawn-attack set contains its square -- the same mirror trick as check
+        // detection.
+        let candidates = pawn_attacks(self.side_to_move.opponent(), target)
+            & self.pieces_of(self.side_to_move, PieceType::Pawn);
 
-            match self.grid[from.0][from.1] {
-                Some(piece) if piece.color == self.side_to_move && piece.kind == PieceType::Pawn => {
-                    let mv = Move { from, to: target, promotion: None };
-                    let mut probe = self.clone();
-                    if probe.make_move(&mv).is_ok() && !in_check(&probe, self.side_to_move) {
-                        return true;
-                    }
-                }
-                _ => {}
+        let mut bits = candidates;
+        while bits != 0 {
+            let from = square_of(bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+
+            let mv = Move { from, to: target, promotion: None };
+            let mut probe = self.clone();
+            if probe.make_move(&mv).is_ok() && !in_check(&probe, self.side_to_move) {
+                return true;
             }
         }
 
@@ -455,36 +814,30 @@ impl Board {
     /// K+NN vs K are deliberately *not* included because mate is possible with
     /// the defender's cooperation. The rule is conservative: it does not detect
     /// blocked-pawn dead positions, so it can miss a draw but cannot invent one.
+    ///
+    /// The bitboard version answers "does any pawn, rook, or queen exist?" with
+    /// three bitboard tests and counts minor pieces with `count_ones`, so the old
+    /// 64-square scan is gone.
     pub fn is_insufficient_material(&self) -> bool {
-        let mut knights = 0u32;
-        let mut bishops = 0u32;
-        let mut even_square_bishop = false;
-        let mut odd_square_bishop = false;
-
-        for r in 0..8 {
-            for c in 0..8 {
-                let Some(piece) = self.grid[r][c] else { continue };
-
-                match piece.kind {
-                    PieceType::Pawn | PieceType::Rook | PieceType::Queen => return false,
-                    PieceType::Knight => knights += 1,
-                    PieceType::Bishop => {
-                        bishops += 1;
-                        if (r + c) % 2 == 0 {
-                            even_square_bishop = true;
-                        } else {
-                            odd_square_bishop = true;
-                        }
-                    }
-                    PieceType::King => {}
-                }
+        for color in [Color::White, Color::Black] {
+            if self.pieces_of(color, PieceType::Pawn) != 0
+                || self.pieces_of(color, PieceType::Rook) != 0
+                || self.pieces_of(color, PieceType::Queen) != 0
+            {
+                return false;
             }
         }
+
+        let knights = (self.pieces_of(Color::White, PieceType::Knight)
+            | self.pieces_of(Color::Black, PieceType::Knight))
+        .count_ones();
+        let bishops = self.pieces_of(Color::White, PieceType::Bishop)
+            | self.pieces_of(Color::Black, PieceType::Bishop);
 
         if knights == 0 {
             // No knight can cover the other color complex, so bishops restricted
             // to one complex can never construct a mating net.
-            return !(even_square_bishop && odd_square_bishop);
+            return !(bishops & EVEN_SQUARES != 0 && bishops & !EVEN_SQUARES != 0);
         }
 
         // A single knight with no bishop is also insufficient; anything more
@@ -530,7 +883,9 @@ impl Board {
             for i in 1..k {
                 let r = (mv.from.0 as isize + dr * i) as usize;
                 let c = (mv.from.1 as isize + dc * i) as usize;
-                if self.grid[r][c].is_some() { return Err(InvalidMove::PathBlocked); }
+                if self.piece_at((r, c)).is_some() {
+                    return Err(InvalidMove::PathBlocked);
+                }
             }
             return Ok(());
         }
@@ -560,13 +915,13 @@ impl Board {
 
         if !allowed { return Err(InvalidMove::CastlingUnavailable); }
 
-        match self.grid[home_row][rook_col] {
+        match self.piece_at((home_row, rook_col)) {
             Some(piece) if piece.color == king.color && piece.kind == PieceType::Rook => {}
             _ => return Err(InvalidMove::CastlingUnavailable),
         }
 
         for &col in gap {
-            if self.grid[home_row][col].is_some() {
+            if self.piece_at((home_row, col)).is_some() {
                 return Err(InvalidMove::PathBlocked);
             }
         }
@@ -594,20 +949,21 @@ impl Board {
             if dr == 2 * forward {
                 if mv.from.0 != home { return Err(InvalidMove::PawnDoublePushFromWrongRank); }
                 let mid = (mv.from.0 as isize + forward) as usize;
-                if self.grid[mid][mv.from.1].is_some() { return Err(InvalidMove::PathBlocked); }
+                if self.piece_at((mid, mv.from.1)).is_some() {
+                    return Err(InvalidMove::PathBlocked);
+                }
             }
-            if self.grid[mv.to.0][mv.to.1].is_some() { return Err(InvalidMove::PawnBlocked); }
+            if self.piece_at(mv.to).is_some() { return Err(InvalidMove::PawnBlocked); }
             return Ok(());
         }
 
         if dc.abs() != 1 || dr != forward { return Err(InvalidMove::BadGeometry); }
 
-        match self.grid[mv.to.0][mv.to.1] {
+        match self.piece_at(mv.to) {
             Some(target) if target.color != p.color => Ok(()),
             None if self.en_passant == Some(mv.to) => {
                 // The captured pawn stands beside the mover, not on `to`.
-                let captured = self.grid[mv.from.0][mv.to.1];
-                match captured {
+                match self.piece_at((mv.from.0, mv.to.1)) {
                     Some(t) if t.color != p.color && t.kind == PieceType::Pawn => Ok(()),
                     _ => Err(InvalidMove::EnPassantUnavailable),
                 }
@@ -629,9 +985,9 @@ impl Board {
     fn validate(&self, mv: &Move) -> Result<(), InvalidMove> {
         if !in_bounds(mv.from) || !in_bounds(mv.to) { return Err(InvalidMove::OutOfBounds); }
 
-        let moving = self.grid[mv.from.0][mv.from.1].ok_or(InvalidMove::NoPieceAtFrom)?;
+        let moving = self.piece_at(mv.from).ok_or(InvalidMove::NoPieceAtFrom)?;
         if moving.color != self.side_to_move { return Err(InvalidMove::WrongColor); }
-        if let Some(target) = self.grid[mv.to.0][mv.to.1]
+        if let Some(target) = self.piece_at(mv.to)
             && target.color == moving.color
         {
             return Err(InvalidMove::OwnPieceAtTo);
@@ -666,18 +1022,10 @@ impl Board {
         match moving.kind {
             PieceType::Pawn => self.validate_pawn(mv, moving),
             PieceType::Knight => {
-                const STEPS: [(isize, isize); 8] = [
-                    (2, 1), (2, -1), (-2, 1), (-2, -1),
-                    (1, 2), (1, -2), (-1, 2), (-1, -2),
-                ];
-                if offset_ok(mv.from, mv.to, &STEPS) { Ok(()) } else { Err(InvalidMove::BadGeometry) }
+                if is_offset(mv.from, mv.to, &KNIGHT_STEPS) { Ok(()) } else { Err(InvalidMove::BadGeometry) }
             }
             PieceType::King => {
-                const STEPS: [(isize, isize); 8] = [
-                    (0, 1), (0, -1), (1, 0), (-1, 0),
-                    (1, 1), (1, -1), (-1, 1), (-1, -1),
-                ];
-                if offset_ok(mv.from, mv.to, &STEPS) { Ok(()) } else { Err(InvalidMove::BadGeometry) }
+                if is_offset(mv.from, mv.to, &KING_STEPS) { Ok(()) } else { Err(InvalidMove::BadGeometry) }
             }
             PieceType::Bishop => self.validate_slide(mv, &[(1, 1), (1, -1), (-1, 1), (-1, -1)]),
             PieceType::Rook => self.validate_slide(mv, &[(0, 1), (0, -1), (1, 0), (-1, 0)]),
@@ -717,28 +1065,48 @@ impl Board {
     /// `unmake_move` is not permitted to re-derive them.
     pub fn make_move(&mut self, mv: &Move) -> Result<Undo, InvalidMove> {
         self.validate(mv)?;
+        Ok(self.make_move_unchecked(mv))
+    }
 
+    /// Applies a move already known to be geometrically valid.
+    ///
+    /// Technically: the body of `make_move` without the `validate` call. The
+    /// legality filter generated these moves itself, so re-validating every
+    /// candidate would repeat work the generator already guaranteed. The public
+    /// `make_move` keeps validation because it is the entry point external
+    /// callers and tests use.
+    ///
+    /// The caller must have established that `mv.from` holds the side to move's
+    /// piece and that `mv` is pseudo-legal; otherwise the bitboard updates can
+    /// clear a bit that was never set.
+    fn make_move_unchecked(&mut self, mv: &Move) -> Undo {
         let prev_side = self.side_to_move;
         let prev_castling = self.castling;
         let prev_en_passant = self.en_passant;
         let prev_halfmove_clock = self.halfmove_clock;
 
-        let moved = self.grid[mv.from.0][mv.from.1].expect("validated above");
+        let moved = self.piece_at(mv.from).expect("caller guaranteed a piece");
 
         // En passant removes a pawn that is beside the mover, not on `to`.
+        // This must be decided before any mutation, because the test is
+        // "diagonal pawn move onto an empty square".
         let captured_square = if is_en_passant_move(self, moved, mv) {
             (mv.from.0, mv.to.1)
         } else {
             mv.to
         };
-        let captured = self.grid[captured_square.0][captured_square.1];
+        let captured = self.piece_at(captured_square);
 
-        self.grid[captured_square.0][captured_square.1] = None;
-        self.grid[mv.from.0][mv.from.1] = None;
-        self.grid[mv.to.0][mv.to.1] = Some(match mv.promotion {
+        if let Some(piece) = captured {
+            self.take_piece(captured_square, piece);
+        }
+        self.take_piece(mv.from, moved);
+
+        let placed = match mv.promotion {
             Some(kind) => Piece { color: moved.color, kind },
             None => moved,
-        });
+        };
+        self.put_piece(mv.to, placed);
 
         // Castling also moves a rook. The corner is implied by the direction.
         let castling_rook = if is_castling_move(moved, mv) {
@@ -748,7 +1116,9 @@ impl Board {
             } else {
                 ((home_row, 0), (home_row, 3))
             };
-            self.grid[rook_to.0][rook_to.1] = self.grid[rook_from.0][rook_from.1].take();
+            let rook = Piece { color: moved.color, kind: PieceType::Rook };
+            self.take_piece(rook_from, rook);
+            self.put_piece(rook_to, rook);
             Some((rook_from, rook_to))
         } else {
             None
@@ -791,10 +1161,11 @@ impl Board {
 
         self.side_to_move = prev_side.opponent();
 
-        Ok(Undo {
+        Undo {
             from: mv.from,
             to: mv.to,
             moved,
+            placed,
             captured,
             captured_square,
             castling_rook,
@@ -802,30 +1173,52 @@ impl Board {
             en_passant: prev_en_passant,
             halfmove_clock: prev_halfmove_clock,
             side_to_move: prev_side,
-        })
+        }
     }
 
     /// Reverses a move previously applied by `make_move`.
     ///
-    /// Technically: a mechanical inverse. It restores the moving piece, the
-    /// captured piece **on the square it actually occupied**, the rook if the
-    /// move was a castle, and the castling/en passant bookkeeping, then hands
-    /// the turn back. It contains no chess knowledge -- no rule checks, no
-    /// "was this a pawn". Any chess reasoning unmake appears to need should have
-    /// been captured in the record at make time instead.
+    /// Technically: a mechanical inverse. It clears the piece that ended up on
+    /// `to` (which may be a promoted piece, hence `Undo::placed`), restores the
+    /// captured piece **on the square it actually occupied**, restores the
+    /// moving piece on its origin, moves the rook back if the move was a castle,
+    /// and then restores the castling/en passant bookkeeping and the turn. It
+    /// contains no chess knowledge -- any reasoning unmake appears to need was
+    /// captured in the record at make time instead.
     pub fn unmake_move(&mut self, undo: &Undo) {
-        self.grid[undo.to.0][undo.to.1] = None;
-        self.grid[undo.captured_square.0][undo.captured_square.1] = undo.captured;
-        self.grid[undo.from.0][undo.from.1] = Some(undo.moved);
+        self.take_piece(undo.to, undo.placed);
+        if let Some(captured) = undo.captured {
+            self.put_piece(undo.captured_square, captured);
+        }
+        self.put_piece(undo.from, undo.moved);
 
         if let Some((rook_from, rook_to)) = undo.castling_rook {
-            self.grid[rook_from.0][rook_from.1] = self.grid[rook_to.0][rook_to.1].take();
+            let rook = Piece { color: undo.moved.color, kind: PieceType::Rook };
+            self.take_piece(rook_to, rook);
+            self.put_piece(rook_from, rook);
         }
 
         self.castling = undo.castling;
         self.en_passant = undo.en_passant;
         self.halfmove_clock = undo.halfmove_clock;
         self.side_to_move = undo.side_to_move;
+
+        // Debug-only invariant: the cached occupancy must still equal the union
+        // of the piece bitboards. A desynchronised cache would not fail loudly
+        // anywhere else -- it would just generate subtly wrong moves.
+        #[cfg(debug_assertions)]
+        {
+            for color in [Color::White, Color::Black] {
+                let mut expected = 0u64;
+                for kind in 0..6 {
+                    expected |= self.pieces[color.index()][kind];
+                }
+                debug_assert_eq!(
+                    self.occupied_by_color[color.index()], expected,
+                    "occupancy cache drifted for {color:?}"
+                );
+            }
+        }
     }
 
     /// Returns `true` if this castle must be rejected on safety grounds.
@@ -836,7 +1229,7 @@ impl Board {
     /// after the move because the king has already passed through it. Checked
     /// against the square the king steps over: f1/g1 or d1/c1 depending on side.
     fn castling_is_forbidden(&self, mv: &Move) -> bool {
-        let Some(moving) = self.grid[mv.from.0][mv.from.1] else { return false };
+        let Some(moving) = self.piece_at(mv.from) else { return false };
         if !is_castling_move(moving, mv) { return false; }
 
         if in_check(self, moving.color) { return true; }
@@ -848,22 +1241,20 @@ impl Board {
     /// Generates every move the side to move may legally play.
     ///
     /// Technically: takes the pseudo-legal list and keeps only moves that do not
-    /// leave the mover's own king attacked. Each candidate is played with
-    /// `make_move`, interrogated with `in_check`, then reverted with
-    /// `unmake_move`, so the board is byte-identical on entry and exit. This
-    /// loop is the entire reason the `Undo` record exists: answering "is this
-    /// move safe?" requires making it, and cloning the board per candidate would
-    /// allocate once per move -- fatal inside a search tree.
+    /// leave the mover's own king attacked. Each candidate is played with the
+    /// unchecked make, interrogated with `in_check`, then reverted with
+    /// `unmake_move`, so the board is bit-identical on entry and exit. The
+    /// generator already guarantees geometry, so validation would be redundant
+    /// here; it exists on the public `make_move` for external callers.
     ///
     /// Castling needs one extra gate before that loop, because two of its rules
     /// concern squares the king has already left by the time the board is
     /// inspected: it may not start in check or pass through an attacked square.
     ///
-    /// Takes `&mut self` rather than `&self` for that same reason. Takes no
-    /// `color` argument because `make_move` validates against
-    /// `self.side_to_move`; a parameter could disagree with that field and cause
-    /// every candidate to be rejected as `WrongColor`. When a parameter must
-    /// always equal a field, derive it from the field.
+    /// Takes `&mut self` for the make/unmake probe. Takes no `color` argument
+    /// because the board's own `side_to_move` is the only source of truth; a
+    /// parameter could disagree with that field and cause every candidate to be
+    /// rejected as `WrongColor`.
     pub fn generate_legal_moves(&mut self) -> Vec<Move> {
         let color = self.side_to_move;
         let pseudo = crate::moves::generate_all_moves(self, color);
@@ -874,18 +1265,10 @@ impl Board {
                 continue;
             }
 
-            // A rejected candidate never mutated the board, because `make_move`
-            // validates before writing. Skipping without unmaking is therefore
-            // safe, and is the payoff for keeping validation pure.
-            let undo = match self.make_move(&mv) {
-                Ok(undo) => undo,
-                Err(_) => continue,
-            };
-
+            let undo = self.make_move_unchecked(&mv);
             if !in_check(self, color) {
                 legal.push(mv);
             }
-
             self.unmake_move(&undo);
         }
 
@@ -893,17 +1276,30 @@ impl Board {
     }
 }
 
+/// Returns `true` when `to` is exactly one fixed step away from `from`.
+///
+/// Technically: the arithmetic happens in `isize` so a negative result cannot
+/// wrap, and the destination is compared as a tuple. Used for knight and king
+/// moves, which have no path to clear -- only bounds and a single offset apply.
+fn is_offset(from: (usize, usize), to: (usize, usize), steps: &[(isize, isize)]) -> bool {
+    steps.iter().any(|&(dr, dc)| {
+        let r = from.0 as isize + dr;
+        let c = from.1 as isize + dc;
+        r >= 0 && r < 8 && c >= 0 && c < 8 && (r as usize, c as usize) == to
+    })
+}
+
 impl fmt::Display for Board {
     /// Renders the position as an 8x8 grid with Unicode pieces, rank 8 first.
     ///
     /// Technically: row 0 is printed as rank 8 so the output reads like a real
-    /// board. The trailing file labels are emitted without a newline so the
-    /// result composes cleanly with `println!`.
+    /// board. Each cell is a `piece_at` lookup; the trailing file labels are
+    /// emitted without a newline so the result composes cleanly with `println!`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for rank in 0..8 {
             write!(f, "{} ", 8 - rank)?;
             for file in 0..8 {
-                match self.grid[rank][file] {
+                match self.piece_at((rank, file)) {
                     Some(piece) => {
                         let ch = match (piece.color, piece.kind) {
                             (Color::White, PieceType::King)   => '♔',

@@ -242,10 +242,10 @@ fn castling_moves_the_rook_and_round_trips() {
 
     let undo = kingside.make_move(&mv((7, 4), (7, 6))).expect("kingside castle");
 
-    assert_eq!(kingside.grid[7][6], Some(p(Color::White, PieceType::King)));
-    assert_eq!(kingside.grid[7][5], Some(p(Color::White, PieceType::Rook)));
-    assert_eq!(kingside.grid[7][4], None, "king left e1");
-    assert_eq!(kingside.grid[7][7], None, "rook left h1");
+    assert_eq!(kingside.piece_at((7, 6)), Some(p(Color::White, PieceType::King)));
+    assert_eq!(kingside.piece_at((7, 5)), Some(p(Color::White, PieceType::Rook)));
+    assert_eq!(kingside.piece_at((7, 4)), None, "king left e1");
+    assert_eq!(kingside.piece_at((7, 7)), None, "rook left h1");
     assert!(!kingside.castling.white_kingside && !kingside.castling.white_queenside);
 
     kingside.unmake_move(&undo);
@@ -265,10 +265,10 @@ fn castling_moves_the_rook_and_round_trips() {
 
     let undo = queenside.make_move(&mv((7, 4), (7, 2))).expect("queenside castle");
 
-    assert_eq!(queenside.grid[7][2], Some(p(Color::White, PieceType::King)));
-    assert_eq!(queenside.grid[7][3], Some(p(Color::White, PieceType::Rook)));
-    assert_eq!(queenside.grid[7][4], None, "king left e1");
-    assert_eq!(queenside.grid[7][0], None, "rook left a1");
+    assert_eq!(queenside.piece_at((7, 2)), Some(p(Color::White, PieceType::King)));
+    assert_eq!(queenside.piece_at((7, 3)), Some(p(Color::White, PieceType::Rook)));
+    assert_eq!(queenside.piece_at((7, 4)), None, "king left e1");
+    assert_eq!(queenside.piece_at((7, 0)), None, "rook left a1");
 
     queenside.unmake_move(&undo);
     assert_eq!(queenside, before, "queenside unmake did not restore the position");
@@ -494,9 +494,9 @@ fn en_passant_capture_removes_the_pawn_beside_the_mover() {
 
     assert_eq!(undo.captured, Some(p(Color::Black, PieceType::Pawn)));
     assert_eq!(undo.captured_square, (3, 3), "capture must be recorded on d5");
-    assert_eq!(white.grid[3][3], None, "the d5 pawn must be removed");
-    assert_eq!(white.grid[3][4], None, "the e5 pawn must leave its square");
-    assert_eq!(white.grid[2][3], Some(p(Color::White, PieceType::Pawn)));
+    assert_eq!(white.piece_at((3, 3)), None, "the d5 pawn must be removed");
+    assert_eq!(white.piece_at((3, 4)), None, "the e5 pawn must leave its square");
+    assert_eq!(white.piece_at((2, 3)), Some(p(Color::White, PieceType::Pawn)));
 
     white.unmake_move(&undo);
     assert_eq!(white, before, "White en passant unmake did not restore the position");
@@ -523,9 +523,9 @@ fn en_passant_capture_removes_the_pawn_beside_the_mover() {
 
     assert_eq!(undo.captured, Some(p(Color::White, PieceType::Pawn)));
     assert_eq!(undo.captured_square, (4, 4), "capture must be recorded on e4");
-    assert_eq!(black.grid[4][4], None, "the e4 pawn must be removed");
-    assert_eq!(black.grid[4][3], None, "the d4 pawn must leave its square");
-    assert_eq!(black.grid[5][4], Some(p(Color::Black, PieceType::Pawn)));
+    assert_eq!(black.piece_at((4, 4)), None, "the e4 pawn must be removed");
+    assert_eq!(black.piece_at((4, 3)), None, "the d4 pawn must leave its square");
+    assert_eq!(black.piece_at((5, 4)), Some(p(Color::Black, PieceType::Pawn)));
 
     black.unmake_move(&undo);
     assert_eq!(black, before, "Black en passant unmake did not restore the position");
@@ -561,7 +561,7 @@ fn en_passant_requires_a_live_target_and_a_capturable_pawn() {
 
     // Target present, but no pawn on the captured square.
     board.en_passant = Some((2, 3));
-    board.grid[3][3] = None;
+    board.set_piece((3, 3), None);
     let before = board.clone();
 
     assert_eq!(board.make_move(&capture), Err(InvalidMove::EnPassantUnavailable));
